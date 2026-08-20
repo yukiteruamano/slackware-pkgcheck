@@ -11,6 +11,7 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 from rich.console import Console
 from rich.progress import (
@@ -93,7 +94,9 @@ def _ensure_utf8_environment() -> str | None:
         if encoding is not None and not _is_utf8(encoding):
             previous = previous or encoding
             with contextlib.suppress(AttributeError, ValueError, OSError):
-                stream.reconfigure(encoding="utf-8", errors="replace")
+                cast_any = getattr(stream, "reconfigure", None)
+                if callable(cast_any):
+                    cast_any(encoding="utf-8", errors="replace")
     if previous is not None:
         os.environ["PYTHONIOENCODING"] = "utf-8"
         os.environ["LC_ALL"] = "en_US.UTF-8"
@@ -327,7 +330,7 @@ def _exec_with_sudo() -> None:
     sudo_bin = shutil.which("sudo")
     if sudo_bin is None:
         raise RuntimeError(t("sudo was not found on the system; run pkgcheck directly as root"))
-    script = os.path.abspath(sys.argv[0])
+    script = str(Path(sys.argv[0]).resolve())
     if Path(script).name == "__main__.py":
         cmd = [sys.executable, "-m", "pkgcheck", *sys.argv[1:]]
     else:
@@ -350,12 +353,14 @@ def _pseudo_prefixes(args: argparse.Namespace) -> tuple[str, ...]:
 
 def _backup_suffixes(args: argparse.Namespace) -> tuple[str, ...]:
     """Normalizes the --backup-suffixes list."""
-    return tuple(s.strip() for s in args.backup_suffixes.split(",") if s.strip())
+    raw: str = cast(str, args.backup_suffixes)
+    return tuple(s.strip() for s in raw.split(",") if s.strip())
 
 
 def _new_suffix(args: argparse.Namespace) -> str:
     """Normalizes the --new-suffix value."""
-    return args.new_suffix.strip()
+    raw: str = cast(str, args.new_suffix)
+    return raw.strip()
 
 
 def _write_auto_log(

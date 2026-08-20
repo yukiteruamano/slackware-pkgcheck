@@ -3,11 +3,27 @@ UV          := uv
 PYPI_URL    := https://upload.pypi.org/legacy/
 TESTPYPI_URL := https://test.pypi.org/legacy/
 
-.PHONY: check lint format format-check test build publish publish-test \
+.PHONY: help check lint format format-check test build typecheck coverage coverage-html audit sync publish publish-test \
         publish-dry-run push release clean
 
 # Objetivo por defecto: `make` -> calidad
-check: lint format-check test
+help:
+	@echo "Targets:"
+	@echo "  check          lint + format-check + typecheck + test"
+	@echo "  lint           ruff check"
+	@echo "  format         ruff format"
+	@echo "  format-check   ruff format --check"
+	@echo "  typecheck      mypy --strict"
+	@echo "  test           unittest discover"
+	@echo "  coverage       tests with coverage + report (>=80%)"
+	@echo "  coverage-html  html coverage report"
+	@echo "  audit          pip-audit"
+	@echo "  sync           uv sync --group dev"
+	@echo "  build          uv build"
+	@echo "  publish        check + build + publish PyPI"
+	@echo "  clean          remove artifacts"
+
+check: lint format-check typecheck test
 
 lint:
 	$(UV) run ruff check .
@@ -18,8 +34,26 @@ format:
 format-check:
 	$(UV) run ruff format --check .
 
+typecheck:
+	$(UV) run mypy src
+
 test:
 	$(UV) run python -m unittest discover -s tests
+
+coverage:
+	$(UV) run coverage run -m unittest discover -s tests
+	$(UV) run coverage report
+
+coverage-html:
+	$(UV) run coverage run -m unittest discover -s tests
+	$(UV) run coverage html
+	@echo "HTML report: htmlcov/index.html"
+
+audit:
+	$(UV) run pip-audit --strict
+
+sync:
+	$(UV) sync --group dev
 
 build:
 	$(UV) build
@@ -42,4 +76,4 @@ push:
 release: publish
 
 clean:
-	rm -rf dist/ build/ *.egg-info
+	rm -rf dist/ build/ *.egg-info htmlcov/ .coverage coverage.xml

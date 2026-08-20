@@ -22,6 +22,13 @@ import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
+
+# NOTE (security): ``ldd`` executes the target binary via the dynamic loader
+# (LD_TRACE). A malicious ELF installed on the system could exploit this.
+# ``--check-libs-deps`` is opt-in and should only be run on trusted
+# installations. The alternative (``readelf -d NEEDED``) was considered but
+# would miss runtime-resolved dependencies; ``ldd`` is kept for completeness.
 
 # Minimum interval between two progress updates (seconds). Reports more often than
 # this would redraw the progress bar too frequently for long scans.
@@ -107,7 +114,7 @@ def check_library_deps(
     """
     paths = list(paths)
     results: list[list[str]] = [[] for _ in paths]
-    futures: dict[Future, int] = {}
+    futures: dict[Future[Any], int] = {}
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pkgcheck-ldd") as executor:
         for index, path in enumerate(paths):
             futures[executor.submit(_missing_libs_of, path, ldd_bin)] = index
@@ -205,7 +212,7 @@ def collect_defined_symbols(
     """
     paths = list(paths)
     defined: set[str] = set()
-    futures: dict[Future, str] = {}
+    futures: dict[Future[Any], str] = {}
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pkgcheck-nm") as executor:
         for path in paths:
             futures[executor.submit(_readelf_symbols, path, readelf_bin)] = path
@@ -239,7 +246,7 @@ def check_undefined_symbols(
     """
     paths = list(paths)
     results: list[list[str]] = [[] for _ in paths]
-    futures: dict[Future, int] = {}
+    futures: dict[Future[Any], int] = {}
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pkgcheck-sym") as executor:
         for index, path in enumerate(paths):
             futures[executor.submit(_undefined_symbols, path, defined_globally, readelf_bin)] = (

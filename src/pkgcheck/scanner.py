@@ -43,6 +43,22 @@ _RG_TIMEOUT = 300
 type Prefixes = tuple[str, ...]
 
 
+def _is_safe_rel(rel: str) -> bool:
+    """Returns whether `rel` is a safe relative path (no traversal, no absolute).
+
+    Rejects absolute paths, ``..`` components and empty segments that would
+    escape the filesystem root when later joined as ``f"/{rel}"``. Slackware
+    records never contain ``..`` but third-party packages could.
+    """
+    if not rel or rel.startswith("/") or rel.startswith("//"):
+        return False
+    # Fast path: common traversal marker
+    if ".." not in rel:
+        return True
+    parts = rel.split("/")
+    return ".." not in parts
+
+
 @dataclass(frozen=True, slots=True)
 class ScanResult:
     """Result of the ripgrep scan."""
@@ -175,7 +191,15 @@ def scan_package_files(
             if rel_path.startswith(pseudo_prefixes):
                 excluded_pseudo += 1
                 continue
-            entries.append((package, _unescape_path(rel_path)))
+            if not _is_safe_rel(rel_path):
+                # Skip path traversal attempts; count as pseudo to keep stats consistent
+                excluded_pseudo += 1
+                continue
+            decoded = _unescape_path(rel_path)
+            if not _is_safe_rel(decoded):
+                excluded_pseudo += 1
+                continue
+            entries.append((package, decoded))
     return ScanResult(
         entries=entries,
         excluded_install=excluded_install,

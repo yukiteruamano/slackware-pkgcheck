@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from enum import Enum
 from functools import partial
+from typing import Any, cast
 
 _DEFAULT_BACKUP_SUFFIXES = (".bak", ".orig")
 _DEFAULT_NEW_SUFFIX = ".new"
@@ -161,7 +162,7 @@ def _run_workers(
     total = len(paths)
     results: list[object] = [None] * total
     window = max(workers * 2, 64)
-    in_flight: dict[Future, int] = {}
+    in_flight: dict[Future[Any], int] = {}
     last_update = time.monotonic()
     done = 0
     index = 0
@@ -201,7 +202,7 @@ def verify_paths(
     """
     check = partial(check_path, backup_suffixes=backup_suffixes, new_suffix=new_suffix)
     results = _run_workers(paths, workers, check, on_progress)
-    return [PathStatus.ERROR if r is None else r for r in results]
+    return [PathStatus.ERROR if r is None else cast(PathStatus, r) for r in results]
 
 
 def verify_paths_with_elf(
@@ -225,7 +226,7 @@ def verify_paths_with_elf(
             statuses.append(PathStatus.ERROR)
             elf_flags.append(False)
         else:
-            status, elf = pair
+            status, elf = cast(tuple[PathStatus, bool], pair)
             statuses.append(status)
             elf_flags.append(elf)
     return statuses, elf_flags

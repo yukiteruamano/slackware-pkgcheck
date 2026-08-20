@@ -1,5 +1,11 @@
 # pkgcheck
 
+[![CI](https://github.com/yukiteruamano/slackware-pkgcheck/actions/workflows/ci.yml/badge.svg)](https://github.com/yukiteruamano/slackware-pkgcheck/actions/workflows/ci.yml)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-green.svg)](LICENSE)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Checked with mypy](https://www.mypy-lang.org/static/mypy_badge.svg)](https://mypy-lang.org/)
+
 Integrity checker for Slackware Linux: verifies that the files recorded by each package
 in `/var/log/packages/` really exist on the system.
 
@@ -185,9 +191,28 @@ are not localized: they are the stable API.
 ## Code quality
 
 ```sh
+make check          # lint + format-check + typecheck + test
+make coverage       # tests with coverage (>=80%)
+make audit          # pip-audit
 uv run ruff check
 uv run ruff format --check
+uv run mypy src
+uv run coverage run -m unittest discover -s tests && uv run coverage report
 ```
 
-Ruff configuration in `pyproject.toml`: `target-version = "py312"` and rules
-`E, F, W, I, UP, B, SIM, C4, RET, ARG, RUF`.
+Tooling: `ruff` (`E,F,W,I,UP,B,SIM,C4,RET,ARG,RUF,S,ANN,PTH,T20,D`), `mypy --strict`,
+`coverage` (branch, fail_under 80), `pip-audit`, `pre-commit`.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, `uv sync --group dev`,
+and `pre-commit install`.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
+
+## Security
+
+`--check-libs-deps` runs `ldd` which executes the target via the dynamic loader
+(`LD_TRACE`). Only run on trusted installations; see `src/pkgcheck/libdeps.py` note.

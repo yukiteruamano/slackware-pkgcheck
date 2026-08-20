@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -17,13 +18,22 @@ from unittest import mock
 from pkgcheck import i18n
 from pkgcheck.cli import (
     _backup_suffixes,
+    _build_parser,
+    _default_workers,
+    _ensure_root,
     _ensure_utf8_environment,
+    _exec_with_sudo,
     _is_utf8,
     _new_suffix,
     _pseudo_prefixes,
+    _run,
+    _write_auto_log,
 )
 from pkgcheck.libdeps import (
+    _is_library_path,
     _missing_libs_of,
+    _readelf_symbols,
+    _undefined_symbols,
     build_library_owner_index,
     check_library_deps,
     check_undefined_symbols,
@@ -38,8 +48,10 @@ from pkgcheck.reporter import (
     print_breakdown,
     print_broken_libs,
     report_path,
+    unique_report_path,
+    write_report,
 )
-from pkgcheck.scanner import scan_package_files
+from pkgcheck.scanner import ScanResult, _is_safe_rel, scan_package_files
 from pkgcheck.verifier import (
     PathStatus,
     _is_elf,
@@ -515,6 +527,119 @@ class LibdepsTest(unittest.TestCase):
     def test_check_library_deps_empty(self) -> None:
         self.assertEqual(check_library_deps([], 4, "ldd"), [])
 
+    def test_is_library_path_variants(self) -> None:
+        self.assertTrue(_is_library_path("usr/libexec/foo.so"))
+        self.assertTrue(_is_library_path("lib64/libbar.so.1"))
+        self.assertFalse(_is_library_path("usr/share/doc/foo.so"))
+        self.assertFalse(_is_library_path("usr/lib/foo.a"))
+        self.assertFalse(_is_library_path("usr/lib/foo"))
+
+    def test_missing_libs_dedup(self) -> None:
+        output = "libfoo.so.1 => not found\nlibfoo.so.1 => not found\nlibbar.so.2 => not found\n"
+        with mock.patch("pkgcheck.libdeps.subprocess.run", return_value=self._fake_run(output)):
+            missing = _missing_libs_of("/x", "ldd")
+        self.assertEqual(missing, ["libfoo.so.1", "libbar.so.2"])
+
+    def test_missing_libs_combined_stdout_stderr(self) -> None:
+        with mock.patch(
+            "pkgcheck.libdeps.subprocess.run",
+            return_value=self._fake_run(
+                "libfoo.so.1 => not found\n", stderr="not a dynamic executable\n"
+            ),
+        ):
+            # stderr contains NOT_DYNAMIC pattern, should return []
+            self.assertEqual(_missing_libs_of("/x", "ldd"), [])
+
+    def test_readelf_symbols_with_version(self) -> None:
+        output = (
+            "     6: 0000000000000000     0 FUNC    GLOBAL DEFAULT  UND puts@GLIBC_2.2.5\n"
+            "    13: 0000000000004a40    26 FUNC    GLOBAL DEFAULT   13 main\n"
+            "    14: 0000000000000000     0 FUNC    GLOBAL DEFAULT   12 foo@VER_1\n"
+        )
+        with mock.patch("pkgcheck.libdeps.subprocess.run", return_value=self._fake_run(output)):
+            symbols = _readelf_symbols("/x", "readelf")
+        self.assertIsNotNone(symbols)
+        assert symbols is not None
+        self.assertIn("main", symbols)
+        self.assertIn("foo@VER_1", symbols)
+        self.assertNotIn("UND", symbols)
+
+    def test_readelf_symbols_timeout_returns_none(self) -> None:
+        with mock.patch(
+            "pkgcheck.libdeps.subprocess.run", side_effect=subprocess.TimeoutExpired("readelf", 60)
+        ):
+            self.assertIsNone(_readelf_symbols("/x", "readelf"))
+
+    def test_readelf_symbols_oserror_returns_none(self) -> None:
+        with mock.patch("pkgcheck.libdeps.subprocess.run", side_effect=OSError("boom")):
+            self.assertIsNone(_readelf_symbols("/x", "readelf"))
+
+    def test_undefined_symbols_versioned(self) -> None:
+        output = (
+            "     6: 0000000000000000     0 FUNC    GLOBAL DEFAULT  UND puts@GLIBC_2.2.5\n"
+            "     7: 0000000000000000     0 FUNC    GLOBAL DEFAULT  UND missing@VER_1\n"
+        )
+        with mock.patch("pkgcheck.libdeps.subprocess.run", return_value=self._fake_run(output)):
+            undefined = _undefined_symbols("/x", {"puts@GLIBC_2.2.5"}, "readelf")
+        self.assertEqual(undefined, ["missing@VER_1"])
+
+    def test_undefined_symbols_timeout_returns_empty(self) -> None:
+        with mock.patch(
+            "pkgcheck.libdeps.subprocess.run", side_effect=subprocess.TimeoutExpired("readelf", 60)
+        ):
+            self.assertEqual(_undefined_symbols("/x", set(), "readelf"), [])
+
+    def test_undefined_symbols_oserror_returns_empty(self) -> None:
+        with mock.patch("pkgcheck.libdeps.subprocess.run", side_effect=OSError("boom")):
+            self.assertEqual(_undefined_symbols("/x", set(), "readelf"), [])
+
+    def test_check_library_deps_future_exception(self) -> None:
+        # Force future.result() to raise
+        with mock.patch("pkgcheck.libdeps.ThreadPoolExecutor") as MockExec:
+            mock_exec = mock.MagicMock()
+            MockExec.return_value.__enter__.return_value = mock_exec
+            f1 = mock.MagicMock()
+            f1.result.side_effect = RuntimeError("boom")
+            mock_exec.submit.return_value = f1
+            with mock.patch("pkgcheck.libdeps.as_completed", return_value=[f1]):
+                result = check_library_deps(["/x"], 1, "ldd")
+            self.assertEqual(result, [[]])
+
+    def test_collect_defined_symbols_future_exception(self) -> None:
+        with mock.patch("pkgcheck.libdeps.ThreadPoolExecutor") as MockExec:
+            mock_exec = mock.MagicMock()
+            MockExec.return_value.__enter__.return_value = mock_exec
+            f1 = mock.MagicMock()
+            f1.result.side_effect = RuntimeError("boom")
+            mock_exec.submit.return_value = f1
+            with mock.patch("pkgcheck.libdeps.as_completed", return_value=[f1]):
+                result = collect_defined_symbols(["/x"], 1, "readelf")
+            self.assertEqual(result, set())
+
+    def test_check_undefined_symbols_future_exception(self) -> None:
+        with mock.patch("pkgcheck.libdeps.ThreadPoolExecutor") as MockExec:
+            mock_exec = mock.MagicMock()
+            MockExec.return_value.__enter__.return_value = mock_exec
+            f1 = mock.MagicMock()
+            f1.result.side_effect = RuntimeError("boom")
+            mock_exec.submit.return_value = f1
+            with mock.patch("pkgcheck.libdeps.as_completed", return_value=[f1]):
+                result = check_undefined_symbols(["/x"], set(), 1, "readelf")
+            self.assertEqual(result, [[]])
+
+    def test_build_library_owner_index_last_wins(self) -> None:
+        entries = [
+            ("pkg-a", "usr/lib/libdup.so.1"),
+            ("pkg-b", "usr/lib/libdup.so.1"),
+        ]
+        index = build_library_owner_index(entries)
+        self.assertEqual(index["libdup.so.1"], "pkg-b")
+
+    def test_build_library_owner_index_libexec(self) -> None:
+        entries = [("pkg-a", "usr/libexec/helper.so")]
+        index = build_library_owner_index(entries)
+        self.assertIn("helper.so", index)
+
 
 class ReporterTest(unittest.TestCase):
     def tearDown(self) -> None:
@@ -694,6 +819,192 @@ class ReporterTest(unittest.TestCase):
         self.assertIn("MISSING:", text)
         self.assertIn("\n\n" + "=" * 46, text)
 
+    def test_unique_report_path_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp)
+            when = datetime(2026, 8, 7, 12, 34, 56)
+            first = log_dir / "pkgcheck-07-08-2026-12-34-56.log"
+            first.write_text("x")
+            second = unique_report_path(log_dir, when, "log")
+            self.assertEqual(second, log_dir / "pkgcheck-07-08-2026-12-34-56-1.log")
+            second.write_text("y")
+            third = unique_report_path(log_dir, when, "log")
+            self.assertEqual(third, log_dir / "pkgcheck-07-08-2026-12-34-56-2.log")
+
+    def test_unique_report_path_too_many_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp)
+            when = datetime(2026, 8, 7, 12, 34, 56)
+            # Mock exists to always True to force 10k loop
+            with mock.patch.object(Path, "exists", return_value=True):
+                with self.assertRaises(OSError):
+                    unique_report_path(log_dir, when, "log")
+
+    def test_write_report_json_and_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            json_path = tmp_path / "out.json"
+            log_path = tmp_path / "out.log"
+            summary = _summary()
+            indexes = self._indexes()
+            when = datetime(2026, 8, 7, 12, 34, 56)
+            write_report(json_path, summary, *indexes, when)
+            doc = json.loads(json_path.read_text())
+            self.assertEqual(doc["generator"], "pkgcheck")
+            self.assertEqual(doc["timestamp"], "2026-08-07T12:34:56")
+            write_report(log_path, summary, *indexes, when)
+            text = log_path.read_text()
+            self.assertIn("MISSING:", text)
+            self.assertIn("pkgcheck v", text)
+
+    def test_write_report_with_broken_and_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            json_path = tmp_path / "out.json"
+            log_path = tmp_path / "out.log"
+            summary = Summary(
+                packages=1,
+                files_checked=1,
+                missing=0,
+                backup=0,
+                pending_new=0,
+                no_access=0,
+                errors=0,
+                excluded_install=0,
+                excluded_pseudo=0,
+                broken_binaries=1,
+                missing_libs=1,
+                undefined_symbol_binaries=1,
+            )
+            when = datetime(2026, 8, 7, 12, 34, 56)
+            broken = self._broken_libs()
+            undefined = {"pkg": {"/bin/a": ["s1"]}}
+            write_report(json_path, summary, *self._indexes(), when, broken, undefined)
+            self.assertIn("broken_libs", json.loads(json_path.read_text()))
+            write_report(log_path, summary, *self._indexes(), when, broken, undefined)
+            text = log_path.read_text()
+            self.assertIn("BROKEN LIBRARY DEPS:", text)
+            self.assertIn("UNDEFINED SYMBOLS", text)
+
+    def test_print_summary_all_branches(self) -> None:
+        from rich.console import Console
+
+        buf = io.StringIO()
+        console = Console(file=buf, width=200, force_terminal=False)
+        summary = Summary(
+            packages=10,
+            files_checked=100,
+            missing=5,
+            backup=2,
+            pending_new=3,
+            no_access=4,
+            errors=6,
+            excluded_install=7,
+            excluded_pseudo=8,
+            broken_binaries=2,
+            missing_libs=3,
+            undefined_symbol_binaries=1,
+        )
+        from pkgcheck.reporter import print_summary
+
+        print_summary(console, summary, 1.23)
+        out = buf.getvalue()
+        self.assertIn("Packages analyzed", out)
+        self.assertIn("Files with backup only", out)
+        self.assertIn("Configs .new pending", out)
+        self.assertIn("Files without access", out)
+        self.assertIn("Verification errors", out)
+        self.assertIn("Install scripts excluded", out)
+        self.assertIn("Pseudo-filesystems excluded", out)
+        self.assertIn("Binaries with missing library deps", out)
+        self.assertIn("Missing shared libraries", out)
+        self.assertIn("Binaries with undefined symbols", out)
+
+    def test_print_breakdown_max_rows_truncation(self) -> None:
+        from rich.console import Console
+
+        buf = io.StringIO()
+        console = Console(file=buf, width=200, force_terminal=False)
+        data = {f"pkg{i}": [f"/file{i}"] for i in range(5)}
+        print_breakdown(console, data, max_rows=2)
+        out = buf.getvalue()
+        self.assertIn("... and 3 more packages", out)
+
+    def test_print_broken_libs_max_rows_truncation(self) -> None:
+        from rich.console import Console
+
+        buf = io.StringIO()
+        console = Console(file=buf, width=200, force_terminal=False)
+        broken = {
+            f"pkg{i}": [BrokenBinary(binary=f"/bin/{i}", missing=["lib.so"], provided_by={})]
+            for i in range(5)
+        }
+        print_broken_libs(broken, max_rows=2) if False else None
+        # Call with explicit console
+        print_broken_libs(console, broken, max_rows=2)
+        out = buf.getvalue()
+        self.assertIn("... and 3 more packages", out)
+
+    def test_print_breakdown_custom_title(self) -> None:
+        from rich.console import Console
+
+        buf = io.StringIO()
+        console = Console(file=buf, width=200, force_terminal=False)
+        print_breakdown(console, {"pkg": ["/a"]}, title="Custom Title")
+        self.assertIn("Custom Title", buf.getvalue())
+
+    def test_text_report_empty_missing(self) -> None:
+        summary = Summary(
+            packages=0,
+            files_checked=0,
+            missing=0,
+            backup=0,
+            pending_new=0,
+            no_access=0,
+            errors=0,
+            excluded_install=0,
+            excluded_pseudo=0,
+        )
+        text = _text_report(summary, {}, {}, {}, {}, {})
+        self.assertIn("(none)", text)
+        self.assertIn("MISSING:", text)
+
+    def test_text_report_all_sections(self) -> None:
+        summary = Summary(
+            packages=1,
+            files_checked=10,
+            missing=1,
+            backup=1,
+            pending_new=1,
+            no_access=1,
+            errors=1,
+            excluded_install=1,
+            excluded_pseudo=1,
+            broken_binaries=1,
+            missing_libs=1,
+            undefined_symbol_binaries=1,
+        )
+        text = _text_report(
+            summary,
+            {"pkg": ["/a"]},
+            {"pkg": ["/b"]},
+            {"pkg": ["/c"]},
+            {"pkg": ["/d"]},
+            {"pkg": ["/e"]},
+            datetime(2026, 8, 7, 12, 34, 56),
+            {
+                "pkg": [
+                    BrokenBinary(binary="/bin/x", missing=["lib.so"], provided_by={"lib.so": None})
+                ]
+            },
+            {"pkg": {"/bin/y": ["sym"]}},
+        )
+        self.assertIn("BACKUP ONLY", text)
+        self.assertIn("NO ACCESS", text)
+        self.assertIn("ERRORS:", text)
+        self.assertIn("BROKEN LIBRARY DEPS:", text)
+        self.assertIn("UNDEFINED SYMBOLS", text)
+
 
 class CliHelperTest(unittest.TestCase):
     def test_backup_suffixes(self) -> None:
@@ -827,6 +1138,1012 @@ class CliIntegrationTest(unittest.TestCase):
             }
             self.assertEqual(before, after)
             self.assertEqual(victim.read_bytes(), b"precious content")
+
+
+class CliParserCoverageTest(unittest.TestCase):
+    def test_default_workers(self) -> None:
+        with mock.patch("os.cpu_count", return_value=None):
+            self.assertEqual(_default_workers(), 5)
+        with mock.patch("os.cpu_count", return_value=1):
+            self.assertEqual(_default_workers(), 5)
+        with mock.patch("os.cpu_count", return_value=100):
+            self.assertEqual(_default_workers(), 32)
+
+    def test_build_parser_defaults(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(["--no-elevate", "--packages-dir", "/tmp"])
+        self.assertEqual(args.packages_dir, "/tmp")
+        self.assertFalse(args.json)
+        self.assertIsNone(args.max_rows)
+
+    def test_build_parser_all_flags(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(
+            [
+                "--no-elevate",
+                "--packages-dir",
+                "/tmp",
+                "--workers",
+                "4",
+                "--json",
+                "--max-rows",
+                "5",
+                "--exclude",
+                "mnt",
+                "--backup-suffixes",
+                ".bak,.orig",
+                "--new-suffix",
+                ".new",
+                "--check-libs-deps",
+                "--quiet",
+                "--lang",
+                "es",
+            ]
+        )
+        self.assertEqual(args.workers, 4)
+        self.assertTrue(args.json)
+        self.assertEqual(args.max_rows, 5)
+        self.assertIn("mnt", args.exclude[0])
+        self.assertTrue(args.check_libs_deps)
+        self.assertTrue(args.quiet)
+
+    def test_build_parser_version(self) -> None:
+        parser = _build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--version"])
+
+    def test_pseudo_prefixes_empty(self) -> None:
+        ns = mock.Mock(exclude=[])
+        self.assertEqual(
+            _pseudo_prefixes(ns), ("dev/", "sys/", "proc/", "run/", "tmp/", "var/run/")
+        )
+
+    def test_backup_suffixes_empty(self) -> None:
+        ns = mock.Mock(backup_suffixes=" , ")
+        self.assertEqual(_backup_suffixes(ns), ())
+
+
+class CliRootCoverageTest(unittest.TestCase):
+    def test_ensure_root_already_root(self) -> None:
+        args = mock.Mock(elevate=False, no_elevate=False, quiet=False, json=False)
+        console = mock.MagicMock()
+        status = mock.MagicMock()
+        with mock.patch("os.geteuid", return_value=0):
+            _ensure_root(args, console, status)
+        console.print.assert_not_called()
+
+    def test_ensure_root_elevate_calls_sudo(self) -> None:
+        args = mock.Mock(elevate=True, no_elevate=False, quiet=False, json=False)
+        console = mock.MagicMock()
+        status = mock.MagicMock()
+        with (
+            mock.patch("os.geteuid", return_value=1000),
+            mock.patch("pkgcheck.cli._exec_with_sudo") as mock_sudo,
+        ):
+            _ensure_root(args, console, status)
+            mock_sudo.assert_called_once()
+
+    def test_ensure_root_no_elevate_warns(self) -> None:
+        for json_flag in (False, True):
+            args = mock.Mock(elevate=False, no_elevate=True, quiet=False, json=json_flag)
+            console = mock.MagicMock()
+            status = mock.MagicMock()
+            with mock.patch("os.geteuid", return_value=1000):
+                _ensure_root(args, console, status)
+            if json_flag:
+                status.print.assert_called()
+            else:
+                console.print.assert_called()
+
+    def test_ensure_root_no_elevate_quiet_no_warn(self) -> None:
+        args = mock.Mock(elevate=False, no_elevate=True, quiet=True, json=False)
+        console = mock.MagicMock()
+        status = mock.MagicMock()
+        with mock.patch("os.geteuid", return_value=1000):
+            _ensure_root(args, console, status)
+        console.print.assert_not_called()
+        status.print.assert_not_called()
+
+    def test_ensure_root_non_tty_no_elevate(self) -> None:
+        args = mock.Mock(elevate=False, no_elevate=False, quiet=False, json=False)
+        console = mock.MagicMock()
+        status = mock.MagicMock()
+        with (
+            mock.patch("os.geteuid", return_value=1000),
+            mock.patch("sys.stdin.isatty", return_value=False),
+        ):
+            _ensure_root(args, console, status)
+            console.print.assert_called()
+
+    def test_ensure_root_confirm_yes(self) -> None:
+        args = mock.Mock(elevate=False, no_elevate=False, quiet=False, json=False)
+        console = mock.MagicMock()
+        status = mock.MagicMock()
+        with (
+            mock.patch("os.geteuid", return_value=1000),
+            mock.patch("sys.stdin.isatty", return_value=True),
+            mock.patch("pkgcheck.cli.Confirm.ask", return_value=True),
+            mock.patch("pkgcheck.cli._exec_with_sudo") as mock_sudo,
+        ):
+            _ensure_root(args, console, status)
+            mock_sudo.assert_called_once()
+
+    def test_ensure_root_confirm_no(self) -> None:
+        args = mock.Mock(elevate=False, no_elevate=False, quiet=False, json=False)
+        console = mock.MagicMock()
+        status = mock.MagicMock()
+        with (
+            mock.patch("os.geteuid", return_value=1000),
+            mock.patch("sys.stdin.isatty", return_value=True),
+            mock.patch("pkgcheck.cli.Confirm.ask", return_value=False),
+            mock.patch("pkgcheck.cli._exec_with_sudo") as mock_sudo,
+        ):
+            _ensure_root(args, console, status)
+            mock_sudo.assert_not_called()
+
+    def test_ensure_root_confirm_json_uses_status_console(self) -> None:
+        args = mock.Mock(elevate=False, no_elevate=False, quiet=False, json=True)
+        console = mock.MagicMock()
+        status = mock.MagicMock()
+        with (
+            mock.patch("os.geteuid", return_value=1000),
+            mock.patch("sys.stdin.isatty", return_value=True),
+            mock.patch("pkgcheck.cli.Confirm.ask", return_value=False) as mock_ask,
+        ):
+            _ensure_root(args, console, status)
+            mock_ask.assert_called_once()
+            # prompt_console should be status when json
+            self.assertEqual(mock_ask.call_args.kwargs.get("console"), status)
+
+    def test_exec_with_sudo_no_sudo(self) -> None:
+        with mock.patch("shutil.which", return_value=None):
+            with self.assertRaises(RuntimeError):
+                _exec_with_sudo()
+
+    def test_exec_with_sudo_main_py(self) -> None:
+        with (
+            mock.patch("shutil.which", return_value="/usr/bin/sudo"),
+            mock.patch("os.execvp") as mock_exec,
+            mock.patch("sys.argv", ["/usr/lib/python3.12/__main__.py", "--no-elevate"]),
+            mock.patch("sys.executable", "/usr/bin/python"),
+        ):
+            try:
+                _exec_with_sudo()
+            except Exception:
+                pass
+            mock_exec.assert_called_once()
+            args = mock_exec.call_args[0][1]
+            self.assertIn("-m", args)
+            self.assertIn("pkgcheck", args)
+
+    def test_exec_with_sudo_script(self) -> None:
+        with (
+            mock.patch("shutil.which", return_value="/usr/bin/sudo"),
+            mock.patch("os.execvp") as mock_exec,
+            mock.patch("sys.argv", ["/usr/bin/pkgcheck", "--json"]),
+        ):
+            try:
+                _exec_with_sudo()
+            except Exception:
+                pass
+            mock_exec.assert_called_once()
+            args = mock_exec.call_args[0][1]
+            self.assertIn("/usr/bin/pkgcheck", args[2] if len(args) > 2 else "")
+
+
+class CliWriteLogCoverageTest(unittest.TestCase):
+    def setUp(self) -> None:
+        i18n.set_language("en")
+
+    def tearDown(self) -> None:
+        i18n.set_language("en")
+
+    def test_write_auto_log_not_root(self) -> None:
+        from rich.console import Console
+
+        buf = io.StringIO()
+        console = Console(file=buf, width=80, force_terminal=False)
+        summary = Summary(
+            packages=1,
+            files_checked=1,
+            missing=0,
+            backup=0,
+            pending_new=0,
+            no_access=0,
+            errors=0,
+            excluded_install=0,
+            excluded_pseudo=0,
+        )
+        with mock.patch("os.geteuid", return_value=1000):
+            result = _write_auto_log(
+                console, datetime(2026, 8, 7, 12, 34, 56), "log", summary, {}, {}, {}, {}, {}
+            )
+        self.assertIsNone(result)
+
+    def test_write_auto_log_success(self) -> None:
+        from rich.console import Console
+
+        i18n.set_language("en")
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = io.StringIO()
+            console = Console(file=buf, width=80, force_terminal=False)
+            summary = Summary(
+                packages=1,
+                files_checked=1,
+                missing=0,
+                backup=0,
+                pending_new=0,
+                no_access=0,
+                errors=0,
+                excluded_install=0,
+                excluded_pseudo=0,
+            )
+            when = datetime(2026, 8, 7, 12, 34, 56)
+            fake_log_dir = Path(tmp)
+            with (
+                mock.patch("os.geteuid", return_value=0),
+                mock.patch("pkgcheck.cli._LOG_DIR", fake_log_dir),
+                mock.patch(
+                    "pkgcheck.cli.unique_report_path",
+                    return_value=fake_log_dir / "pkgcheck-07-08-2026-12-34-56.log",
+                ) as mock_path,
+            ):
+                result = _write_auto_log(console, when, "log", summary, {}, {}, {}, {}, {})
+                self.assertIsNotNone(result)
+                self.assertTrue(result.exists())
+                text = result.read_text()
+                self.assertTrue("MISSING" in text or "FALTANTES" in text)
+
+    def test_write_auto_log_oserror(self) -> None:
+        from rich.console import Console
+
+        i18n.set_language("en")
+        buf = io.StringIO()
+        console = Console(file=buf, width=80, force_terminal=False)
+        summary = Summary(
+            packages=1,
+            files_checked=1,
+            missing=0,
+            backup=0,
+            pending_new=0,
+            no_access=0,
+            errors=0,
+            excluded_install=0,
+            excluded_pseudo=0,
+        )
+        when = datetime(2026, 8, 7, 12, 34, 56)
+        with (
+            mock.patch("os.geteuid", return_value=0),
+            mock.patch("pkgcheck.cli.unique_report_path", return_value=Path("/tmp/x.log")),
+            mock.patch("pkgcheck.cli.write_report", side_effect=OSError("boom")),
+            mock.patch("pkgcheck.cli._LOG_DIR", Path("/tmp")),
+        ):
+            result = _write_auto_log(console, when, "log", summary, {}, {}, {}, {}, {})
+            self.assertIsNone(result)
+            out = buf.getvalue()
+            self.assertTrue("Could not write" in out or "No se pudo" in out)
+
+
+class CliRunCoverageTest(unittest.TestCase):
+    def setUp(self) -> None:
+        i18n.set_language("en")
+
+    def tearDown(self) -> None:
+        i18n.set_language("en")
+
+    def _make_args(self, **overrides):
+        defaults = dict(
+            quiet=False,
+            json=False,
+            check_libs_deps=False,
+            check_libs_symbols=False,
+            workers=2,
+            max_rows=None,
+            exclude=[],
+            backup_suffixes=".bak,.orig",
+            new_suffix=".new",
+        )
+        defaults.update(overrides)
+        return mock.Mock(**defaults)
+
+    def test_run_no_entries(self) -> None:
+        from rich.console import Console
+
+        buf = io.StringIO()
+        console = Console(file=buf, width=80, force_terminal=False)
+        status = Console(file=io.StringIO(), width=80, force_terminal=False)
+        args = self._make_args()
+        with mock.patch(
+            "pkgcheck.cli.scan_package_files",
+            return_value=ScanResult(entries=[], excluded_install=0, excluded_pseudo=0),
+        ):
+            _run(console, status, args, Path("/tmp"), "rg", None, None)
+        self.assertIn(
+            "No registered files",
+            buf.getvalue()
+            if not args.json
+            else status.file.getvalue()
+            if hasattr(status, "file")
+            else "",
+        )
+
+    def test_run_simple_missing_and_backup(self) -> None:
+        from rich.console import Console
+
+        buf = io.StringIO()
+        console = Console(file=buf, width=120, force_terminal=False, stderr=False)
+        status = Console(file=io.StringIO(), width=120, force_terminal=False, stderr=True)
+        args = self._make_args(quiet=False, json=False)
+        entries = [("pkg-a", "usr/bin/foo"), ("pkg-a", "usr/bin/bar"), ("pkg-b", "etc/conf.new")]
+        scan_result = ScanResult(entries=entries, excluded_install=1, excluded_pseudo=2)
+        statuses = [PathStatus.MISSING, PathStatus.BACKUP, PathStatus.NEW_PENDING]
+        with (
+            mock.patch("pkgcheck.cli.scan_package_files", return_value=scan_result),
+            mock.patch("pkgcheck.cli.verify_paths", return_value=statuses),
+            mock.patch("pkgcheck.cli.Progress") as MockProgress,
+        ):
+            mock_prog = mock.MagicMock()
+            MockProgress.return_value.__enter__.return_value = mock_prog
+            mock_prog.add_task.return_value = 0
+            with tempfile.TemporaryDirectory() as tmp:
+                fake_dir = Path(tmp)
+                with (
+                    mock.patch("pkgcheck.cli._LOG_DIR", fake_dir),
+                    mock.patch("os.geteuid", return_value=0),
+                ):
+                    _run(console, status, args, Path("/tmp"), "rg", None, None)
+        out = buf.getvalue()
+        self.assertIn("Missing files by package", out)
+
+    def test_run_with_errors_and_no_access(self) -> None:
+        from rich.console import Console
+
+        buf = io.StringIO()
+        console = Console(file=buf, width=120, force_terminal=False)
+        status = Console(file=io.StringIO(), width=120, force_terminal=False)
+        args = self._make_args(quiet=False, json=False)
+        entries = [("pkg", "usr/bin/a"), ("pkg", "usr/bin/b"), ("pkg", "usr/bin/c")]
+        statuses = [PathStatus.ERROR, PathStatus.NO_ACCESS, PathStatus.EXISTS]
+        scan_result = ScanResult(entries=entries, excluded_install=0, excluded_pseudo=0)
+        with (
+            mock.patch("pkgcheck.cli.scan_package_files", return_value=scan_result),
+            mock.patch("pkgcheck.cli.verify_paths", return_value=statuses),
+            mock.patch("pkgcheck.cli.Progress") as MockProgress,
+        ):
+            mock_prog = mock.MagicMock()
+            MockProgress.return_value.__enter__.return_value = mock_prog
+            mock_prog.add_task.return_value = 0
+            with tempfile.TemporaryDirectory() as tmp:
+                with (
+                    mock.patch("pkgcheck.cli._LOG_DIR", Path(tmp)),
+                    mock.patch("os.geteuid", return_value=0),
+                ):
+                    _run(console, status, args, Path("/tmp"), "rg", None, None)
+        out = buf.getvalue()
+        self.assertIn("Files with verification errors", out)
+
+    def test_run_quiet_no_breakdown(self) -> None:
+        from rich.console import Console
+
+        buf = io.StringIO()
+        console = Console(file=buf, width=120, force_terminal=False)
+        status = Console(file=io.StringIO(), width=120, force_terminal=False)
+        args = self._make_args(quiet=True, json=False)
+        entries = [("pkg", "usr/bin/foo")]
+        scan_result = ScanResult(entries=entries, excluded_install=0, excluded_pseudo=0)
+        with (
+            mock.patch("pkgcheck.cli.scan_package_files", return_value=scan_result),
+            mock.patch("pkgcheck.cli.verify_paths", return_value=[PathStatus.MISSING]),
+            mock.patch("pkgcheck.cli.Progress") as MockProgress,
+        ):
+            mock_prog = mock.MagicMock()
+            MockProgress.return_value.__enter__.return_value = mock_prog
+            mock_prog.add_task.return_value = 0
+            with tempfile.TemporaryDirectory() as tmp:
+                with (
+                    mock.patch("pkgcheck.cli._LOG_DIR", Path(tmp)),
+                    mock.patch("os.geteuid", return_value=0),
+                ):
+                    _run(console, status, args, Path("/tmp"), "rg", None, None)
+        # quiet hides breakdown, but summary still printed
+        self.assertNotIn("Missing files by package", buf.getvalue())
+
+    def test_run_json_no_root_writes_stdout(self) -> None:
+        from rich.console import Console
+
+        console = Console(file=io.StringIO(), width=80, force_terminal=False)
+        status = Console(file=io.StringIO(), width=80, force_terminal=False, stderr=True)
+        args = self._make_args(quiet=False, json=True)
+        entries = [("pkg", "usr/bin/foo")]
+        scan_result = ScanResult(entries=entries, excluded_install=0, excluded_pseudo=0)
+        with (
+            mock.patch("pkgcheck.cli.scan_package_files", return_value=scan_result),
+            mock.patch("pkgcheck.cli.verify_paths", return_value=[PathStatus.MISSING]),
+            mock.patch("pkgcheck.cli.Progress") as MockProgress,
+            mock.patch("os.geteuid", return_value=1000),
+            mock.patch("sys.stdout", new=io.StringIO()) as fake_out,
+        ):
+            mock_prog = mock.MagicMock()
+            MockProgress.return_value.__enter__.return_value = mock_prog
+            mock_prog.add_task.return_value = 0
+            _run(console, status, args, Path("/tmp"), "rg", None, None)
+            self.assertIn("generator", fake_out.getvalue())
+
+    def test_run_json_with_root_writes_log(self) -> None:
+        from rich.console import Console
+
+        console = Console(file=io.StringIO(), width=80, force_terminal=False)
+        status = Console(file=io.StringIO(), width=80, force_terminal=False)
+        args = self._make_args(quiet=False, json=True)
+        entries = [("pkg", "usr/bin/foo")]
+        scan_result = ScanResult(entries=entries, excluded_install=0, excluded_pseudo=0)
+        with (
+            mock.patch("pkgcheck.cli.scan_package_files", return_value=scan_result),
+            mock.patch("pkgcheck.cli.verify_paths", return_value=[PathStatus.MISSING]),
+            mock.patch("pkgcheck.cli.Progress") as MockProgress,
+        ):
+            mock_prog = mock.MagicMock()
+            MockProgress.return_value.__enter__.return_value = mock_prog
+            mock_prog.add_task.return_value = 0
+            with tempfile.TemporaryDirectory() as tmp:
+                with (
+                    mock.patch("pkgcheck.cli._LOG_DIR", Path(tmp)),
+                    mock.patch("os.geteuid", return_value=0),
+                ):
+                    _run(console, status, args, Path("/tmp"), "rg", None, None)
+                # log should be created
+                self.assertTrue(any(Path(tmp).iterdir()))
+
+    def test_run_no_access_warning(self) -> None:
+        from rich.console import Console
+
+        buf = io.StringIO()
+        console = Console(file=buf, width=120, force_terminal=False)
+        status = Console(file=io.StringIO(), width=120, force_terminal=False)
+        args = self._make_args(quiet=False, json=False)
+        entries = [("pkg", "usr/bin/secret")]
+        scan_result = ScanResult(entries=entries, excluded_install=0, excluded_pseudo=0)
+        with (
+            mock.patch("pkgcheck.cli.scan_package_files", return_value=scan_result),
+            mock.patch("pkgcheck.cli.verify_paths", return_value=[PathStatus.NO_ACCESS]),
+            mock.patch("pkgcheck.cli.Progress") as MockProgress,
+        ):
+            mock_prog = mock.MagicMock()
+            MockProgress.return_value.__enter__.return_value = mock_prog
+            mock_prog.add_task.return_value = 0
+            with tempfile.TemporaryDirectory() as tmp:
+                with (
+                    mock.patch("pkgcheck.cli._LOG_DIR", Path(tmp)),
+                    mock.patch("os.geteuid", return_value=0),
+                ):
+                    _run(console, status, args, Path("/tmp"), "rg", None, None)
+        self.assertIn("without access", buf.getvalue())
+
+    def test_run_with_libs_deps(self) -> None:
+        from rich.console import Console
+
+        buf = io.StringIO()
+        console = Console(file=buf, width=200, force_terminal=False)
+        status = Console(file=io.StringIO(), width=200, force_terminal=False)
+        args = self._make_args(quiet=False, json=False, check_libs_deps=True)
+        entries = [("pkg-a", "usr/bin/foo"), ("pkg-b", "usr/lib/libfoo.so.1")]
+        scan_result = ScanResult(entries=entries, excluded_install=0, excluded_pseudo=0)
+        statuses = [PathStatus.EXISTS, PathStatus.EXISTS]
+        elf_flags = [True, True]
+        with (
+            mock.patch("pkgcheck.cli.scan_package_files", return_value=scan_result),
+            mock.patch("pkgcheck.cli.verify_paths_with_elf", return_value=(statuses, elf_flags)),
+            mock.patch(
+                "pkgcheck.cli.build_library_owner_index", return_value={"libfoo.so.1": "pkg-b"}
+            ),
+            mock.patch("pkgcheck.cli.check_library_deps", return_value=[["libmissing.so"], []]),
+            mock.patch("pkgcheck.cli.collect_defined_symbols", return_value=set()),
+            mock.patch("pkgcheck.cli.check_undefined_symbols", return_value=[[], []]),
+            mock.patch("pkgcheck.cli.Progress") as MockProgress,
+        ):
+            mock_prog = mock.MagicMock()
+            MockProgress.return_value.__enter__.return_value = mock_prog
+            mock_prog.add_task.return_value = 0
+            with tempfile.TemporaryDirectory() as tmp:
+                with (
+                    mock.patch("pkgcheck.cli._LOG_DIR", Path(tmp)),
+                    mock.patch("os.geteuid", return_value=0),
+                ):
+                    _run(console, status, args, Path("/tmp"), "rg", "ldd", None)
+        out = buf.getvalue()
+        self.assertIn("Binaries with missing library deps", out)
+
+    def test_run_with_libs_and_symbols(self) -> None:
+        from rich.console import Console
+
+        buf = io.StringIO()
+        console = Console(file=buf, width=200, force_terminal=False)
+        status = Console(file=io.StringIO(), width=200, force_terminal=False)
+        args = self._make_args(
+            quiet=False, json=False, check_libs_deps=True, check_libs_symbols=True
+        )
+        entries = [("pkg-a", "usr/bin/foo")]
+        scan_result = ScanResult(entries=entries, excluded_install=0, excluded_pseudo=0)
+        statuses = [PathStatus.EXISTS]
+        elf_flags = [True]
+        with (
+            mock.patch("pkgcheck.cli.scan_package_files", return_value=scan_result),
+            mock.patch("pkgcheck.cli.verify_paths_with_elf", return_value=(statuses, elf_flags)),
+            mock.patch("pkgcheck.cli.build_library_owner_index", return_value={}),
+            mock.patch("pkgcheck.cli.check_library_deps", return_value=[[]]),
+            mock.patch("pkgcheck.cli.collect_defined_symbols", return_value={"sym1"}),
+            mock.patch("pkgcheck.cli.check_undefined_symbols", return_value=[["undef1"]]),
+            mock.patch("pkgcheck.cli.Progress") as MockProgress,
+        ):
+            mock_prog = mock.MagicMock()
+            MockProgress.return_value.__enter__.return_value = mock_prog
+            mock_prog.add_task.return_value = 0
+            with tempfile.TemporaryDirectory() as tmp:
+                with (
+                    mock.patch("pkgcheck.cli._LOG_DIR", Path(tmp)),
+                    mock.patch("os.geteuid", return_value=0),
+                ):
+                    _run(console, status, args, Path("/tmp"), "rg", "ldd", "readelf")
+        out = buf.getvalue()
+        self.assertIn("Binaries with undefined symbols", out)
+
+    def test_run_all_exist_no_missing(self) -> None:
+        from rich.console import Console
+
+        buf = io.StringIO()
+        console = Console(file=buf, width=120, force_terminal=False)
+        status = Console(file=io.StringIO(), width=120, force_terminal=False)
+        args = self._make_args(quiet=False, json=False)
+        entries = [("pkg", "usr/bin/foo")]
+        scan_result = ScanResult(entries=entries, excluded_install=0, excluded_pseudo=0)
+        with (
+            mock.patch("pkgcheck.cli.scan_package_files", return_value=scan_result),
+            mock.patch("pkgcheck.cli.verify_paths", return_value=[PathStatus.EXISTS]),
+            mock.patch("pkgcheck.cli.Progress") as MockProgress,
+        ):
+            mock_prog = mock.MagicMock()
+            MockProgress.return_value.__enter__.return_value = mock_prog
+            mock_prog.add_task.return_value = 0
+            with tempfile.TemporaryDirectory() as tmp:
+                with (
+                    mock.patch("pkgcheck.cli._LOG_DIR", Path(tmp)),
+                    mock.patch("os.geteuid", return_value=0),
+                ):
+                    _run(console, status, args, Path("/tmp"), "rg", None, None)
+        self.assertIn("All registered files exist", buf.getvalue())
+
+    def test_run_with_libs_deps_no_elf(self) -> None:
+        from rich.console import Console
+
+        buf = io.StringIO()
+        console = Console(file=buf, width=200, force_terminal=False)
+        status = Console(file=io.StringIO(), width=200, force_terminal=False)
+        args = self._make_args(quiet=False, json=False, check_libs_deps=True)
+        entries = [("pkg-a", "usr/bin/foo")]
+        scan_result = ScanResult(entries=entries, excluded_install=0, excluded_pseudo=0)
+        statuses = [PathStatus.EXISTS]
+        elf_flags = [False]  # no elf, so no ldd
+        with (
+            mock.patch("pkgcheck.cli.scan_package_files", return_value=scan_result),
+            mock.patch("pkgcheck.cli.verify_paths_with_elf", return_value=(statuses, elf_flags)),
+            mock.patch("pkgcheck.cli.Progress") as MockProgress,
+        ):
+            mock_prog = mock.MagicMock()
+            MockProgress.return_value.__enter__.return_value = mock_prog
+            mock_prog.add_task.return_value = 0
+            with tempfile.TemporaryDirectory() as tmp:
+                with (
+                    mock.patch("pkgcheck.cli._LOG_DIR", Path(tmp)),
+                    mock.patch("os.geteuid", return_value=0),
+                ):
+                    _run(console, status, args, Path("/tmp"), "rg", "ldd", None)
+        # no broken libs printed, but should not crash
+        self.assertNotIn("Binaries with missing", buf.getvalue())
+
+
+class CliMainCoverageTest(unittest.TestCase):
+    def _call_main(self, argv):
+        import pkgcheck.cli
+
+        with (
+            mock.patch.object(sys, "argv", ["pkgcheck", *argv]),
+            mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+            mock.patch("pkgcheck.cli._ensure_root"),
+            mock.patch("pkgcheck.cli.Console") as MockConsole,
+        ):
+            mock_console = mock.MagicMock()
+            MockConsole.return_value = mock_console
+            yield pkgcheck.cli, mock_console
+
+    def test_main_invalid_lang_fallback(self) -> None:
+        # override lang unsupported → should fallback and then error on args.lang
+        with (
+            mock.patch.object(
+                sys, "argv", ["pkgcheck", "--lang", "xx", "--no-elevate", "--packages-dir", "/tmp"]
+            ),
+            mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+            mock.patch("pkgcheck.cli._ensure_root"),
+            mock.patch("pkgcheck.cli.Console"),
+        ):
+            with (
+                mock.patch("pkgcheck.cli.set_language") as mock_set_lang,
+                mock.patch("pkgcheck.cli.detect_language", return_value="en"),
+            ):
+                # need to trigger parser.error for unsupported lang
+                with self.assertRaises(SystemExit) as cm:
+                    import pkgcheck.cli
+
+                    pkgcheck.cli.main()
+                self.assertEqual(cm.exception.code, 2)
+
+    def test_main_packages_dir_not_exist(self) -> None:
+        with (
+            mock.patch.object(
+                sys, "argv", ["pkgcheck", "--no-elevate", "--packages-dir", "/nonexistent_xyz"]
+            ),
+            mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+            mock.patch("pkgcheck.cli._ensure_root"),
+            mock.patch("pkgcheck.cli.Console"),
+        ):
+            with self.assertRaises(SystemExit) as cm:
+                import pkgcheck.cli
+
+                pkgcheck.cli.main()
+            self.assertEqual(cm.exception.code, 2)
+
+    def test_main_workers_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for workers in ["0", "9999"]:
+                with (
+                    mock.patch.object(
+                        sys,
+                        "argv",
+                        ["pkgcheck", "--no-elevate", "--packages-dir", tmp, "--workers", workers],
+                    ),
+                    mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                    mock.patch("pkgcheck.cli._ensure_root"),
+                    mock.patch("pkgcheck.cli.Console"),
+                ):
+                    with self.assertRaises(SystemExit) as cm:
+                        import pkgcheck.cli
+
+                        pkgcheck.cli.main()
+                    self.assertEqual(cm.exception.code, 2)
+
+    def test_main_max_rows_and_new_suffix_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["pkgcheck", "--no-elevate", "--packages-dir", tmp, "--max-rows", "0"],
+                ),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_root"),
+                mock.patch("pkgcheck.cli.Console"),
+            ):
+                with self.assertRaises(SystemExit):
+                    import pkgcheck.cli
+
+                    pkgcheck.cli.main()
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["pkgcheck", "--no-elevate", "--packages-dir", tmp, "--new-suffix", " "],
+                ),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_root"),
+                mock.patch("pkgcheck.cli.Console"),
+            ):
+                with self.assertRaises(SystemExit):
+                    import pkgcheck.cli
+
+                    pkgcheck.cli.main()
+
+    def test_main_rg_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(sys, "argv", ["pkgcheck", "--no-elevate", "--packages-dir", tmp]),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_root"),
+                mock.patch("pkgcheck.cli.Console"),
+                mock.patch("shutil.which", return_value=None),
+            ):
+                with self.assertRaises(SystemExit) as cm:
+                    import pkgcheck.cli
+
+                    pkgcheck.cli.main()
+                self.assertEqual(cm.exception.code, 2)
+
+    def test_main_symbols_requires_deps_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["pkgcheck", "--no-elevate", "--packages-dir", tmp, "--check-libs-symbols"],
+                ),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_root"),
+                mock.patch("pkgcheck.cli.Console"),
+                mock.patch("shutil.which", return_value="/usr/bin/rg"),
+            ):
+                with self.assertRaises(SystemExit) as cm:
+                    import pkgcheck.cli
+
+                    pkgcheck.cli.main()
+                self.assertEqual(cm.exception.code, 2)
+
+    def test_main_ldd_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["pkgcheck", "--no-elevate", "--packages-dir", tmp, "--check-libs-deps"],
+                ),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_root"),
+                mock.patch("pkgcheck.cli.Console"),
+                mock.patch(
+                    "shutil.which", side_effect=lambda x: "/usr/bin/rg" if x == "rg" else None
+                ),
+            ):
+                with self.assertRaises(SystemExit) as cm:
+                    import pkgcheck.cli
+
+                    pkgcheck.cli.main()
+                self.assertEqual(cm.exception.code, 2)
+
+    def test_main_success_with_mocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "demo-1.0").write_text("FILE LIST:\nusr/bin/foo\n")
+            with (
+                mock.patch.object(
+                    sys, "argv", ["pkgcheck", "--no-elevate", "--packages-dir", tmp, "--json"]
+                ),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_root"),
+                mock.patch("shutil.which", return_value="/usr/bin/rg"),
+                mock.patch("pkgcheck.cli._run") as mock_run,
+            ):
+                import pkgcheck.cli
+
+                # _run is mocked, so main should not raise
+                try:
+                    pkgcheck.cli.main()
+                except SystemExit as e:
+                    # _run mocked, should not exit 2
+                    self.assertNotEqual(e.code, 2)
+                mock_run.assert_called_once()
+
+    def test_main_keyboard_interrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(sys, "argv", ["pkgcheck", "--no-elevate", "--packages-dir", tmp]),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_root"),
+                mock.patch("shutil.which", return_value="/usr/bin/rg"),
+                mock.patch("pkgcheck.cli._run", side_effect=KeyboardInterrupt),
+                mock.patch("pkgcheck.cli.Console") as MockConsole,
+            ):
+                mock_console = mock.MagicMock()
+                MockConsole.return_value = mock_console
+                with self.assertRaises(SystemExit) as cm:
+                    import pkgcheck.cli
+
+                    pkgcheck.cli.main()
+                self.assertEqual(cm.exception.code, 130)
+
+    def test_main_runtime_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(sys, "argv", ["pkgcheck", "--no-elevate", "--packages-dir", tmp]),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_root"),
+                mock.patch("shutil.which", return_value="/usr/bin/rg"),
+                mock.patch("pkgcheck.cli._run", side_effect=RuntimeError("boom")),
+                mock.patch("pkgcheck.cli.Console") as MockConsole,
+            ):
+                mock_console = mock.MagicMock()
+                MockConsole.return_value = mock_console
+                with self.assertRaises(SystemExit) as cm:
+                    import pkgcheck.cli
+
+                    pkgcheck.cli.main()
+                self.assertEqual(cm.exception.code, 1)
+
+    def test_main_utf8_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(sys, "argv", ["pkgcheck", "--no-elevate", "--packages-dir", tmp]),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value="latin-1"),
+                mock.patch("pkgcheck.cli._ensure_root"),
+                mock.patch("shutil.which", return_value="/usr/bin/rg"),
+                mock.patch("pkgcheck.cli._run"),
+                mock.patch("pkgcheck.cli.Console") as MockConsole,
+            ):
+                mock_console = mock.MagicMock()
+                MockConsole.return_value = mock_console
+                import pkgcheck.cli
+
+                pkgcheck.cli.main()
+                # should have printed warning
+                self.assertTrue(mock_console.print.called)
+
+    def test_main_readelf_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "pkgcheck",
+                        "--no-elevate",
+                        "--packages-dir",
+                        tmp,
+                        "--check-libs-deps",
+                        "--check-libs-symbols",
+                    ],
+                ),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_root"),
+                mock.patch("pkgcheck.cli.Console"),
+                mock.patch(
+                    "shutil.which",
+                    side_effect=lambda x: (
+                        "/usr/bin/rg" if x == "rg" else "/usr/bin/ldd" if x == "ldd" else None
+                    ),
+                ),
+            ):
+                with self.assertRaises(SystemExit) as cm:
+                    import pkgcheck.cli
+
+                    pkgcheck.cli.main()
+                self.assertEqual(cm.exception.code, 2)
+
+
+class ScannerCoverageTest(unittest.TestCase):
+    def test_is_safe_rel(self) -> None:
+        self.assertFalse(_is_safe_rel(""))
+        self.assertFalse(_is_safe_rel("/etc/passwd"))
+        self.assertFalse(_is_safe_rel("//etc/passwd"))
+        self.assertFalse(_is_safe_rel("a/../b"))
+        self.assertFalse(_is_safe_rel("../a"))
+        self.assertFalse(_is_safe_rel("a/.."))
+        self.assertTrue(_is_safe_rel("usr/bin/foo"))
+        self.assertTrue(_is_safe_rel("a/b/c"))
+        self.assertTrue(_is_safe_rel("a..b/c"))
+
+    def test_build_rg_command(self) -> None:
+        from pkgcheck.scanner import build_rg_command
+
+        cmd = build_rg_command("/usr/bin/rg", Path("/tmp"))
+        self.assertIn("/usr/bin/rg", cmd)
+        self.assertIn("--multiline", cmd)
+        self.assertIn("--", cmd)
+        self.assertEqual(cmd[-1], "/tmp")
+
+    def test_scan_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch(
+                "pkgcheck.scanner.subprocess.run", side_effect=subprocess.TimeoutExpired("rg", 300)
+            ):
+                with self.assertRaises(RuntimeError) as cm:
+                    scan_package_files(Path(tmp), "rg")
+                self.assertIn("timed out", str(cm.exception))
+
+    def test_scan_returncode_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = types.SimpleNamespace(returncode=2, stdout="", stderr="error")
+            with mock.patch("pkgcheck.scanner.subprocess.run", return_value=fake):
+                with self.assertRaises(RuntimeError) as cm:
+                    scan_package_files(Path(tmp), "rg")
+                self.assertIn("could not scan", str(cm.exception))
+
+    def test_scan_safe_rel_filtered(self) -> None:
+        rg = shutil.which("rg")
+        if rg is None:
+            self.skipTest("ripgrep not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            # record with traversal attempt should be filtered as pseudo
+            (tmp_path / "evil-1.0").write_bytes(b"FILE LIST:\n../etc/passwd\nusr/bin/ok\n")
+            result = scan_package_files(tmp_path, rg)
+            rels = [r for _, r in result.entries]
+            self.assertNotIn("../etc/passwd", rels)
+            self.assertIn("usr/bin/ok", rels)
+
+
+class VerifierCoverageTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _path(self, rel: str) -> str:
+        return os.path.join(str(self.dir), rel)
+
+    def test_check_path_error_generic_oserror(self) -> None:
+        with mock.patch("os.lstat", side_effect=OSError("generic")):
+            self.assertIs(check_path(self._path("x")), PathStatus.ERROR)
+
+    def test_is_elf_open_oserror(self) -> None:
+        path = self._path("prog")
+        with open(path, "wb") as f:
+            f.write(b"\x7fELF\x02\x01\x01\x00")
+        os.chmod(path, 0o755)
+        with mock.patch("os.open", side_effect=OSError("boom")):
+            self.assertFalse(_is_elf(path))
+
+    def test_is_elf_fdopen_oserror(self) -> None:
+        path = self._path("prog2")
+        with open(path, "wb") as f:
+            f.write(b"\x7fELF\x02\x01\x01\x00")
+        os.chmod(path, 0o755)
+        # os.open succeeds but fdopen raises
+        with mock.patch("os.fdopen", side_effect=OSError("boom")):
+            # need to mock open to return fd, but fdopen will raise
+            self.assertFalse(_is_elf(path))
+
+    def test_run_workers_exception_handling(self) -> None:
+        from pkgcheck.verifier import _run_workers
+
+        def boom(_):
+            raise RuntimeError("boom")
+
+        results = _run_workers(["a", "b"], workers=2, worker=boom, on_progress=None)
+        self.assertEqual(results, [None, None])
+
+    def test_verify_paths_error_on_exception(self) -> None:
+        with mock.patch("pkgcheck.verifier.check_path", side_effect=RuntimeError("boom")):
+            statuses = verify_paths(["/a", "/b"], workers=2)
+            self.assertEqual(statuses, [PathStatus.ERROR, PathStatus.ERROR])
+
+    def test_check_path_new_suffix_backup_priority(self) -> None:
+        # Test that NEW_PENDING takes precedence over BACKUP? Actually check_path checks new before backup
+        open(self._path("foo.new"), "w").close()
+        open(self._path("foo.bak"), "w").close()
+        # foo (without suffix) has both .new and .bak, should be NEW_PENDING
+        self.assertIs(check_path(self._path("foo")), PathStatus.NEW_PENDING)
+
+
+class I18nCoverageTest(unittest.TestCase):
+    def tearDown(self) -> None:
+        i18n.set_language("en")
+
+    def test_os_code_locale_error(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("pkgcheck.i18n.locale.getlocale", side_effect=ValueError("bad")),
+        ):
+            # detect_language should fall back to en without crashing
+            self.assertEqual(i18n.detect_language(), "en")
+
+    def test_set_language_oserror(self) -> None:
+        # Simulate files() raising OSError and JSON decode error
+        with mock.patch("pkgcheck.i18n.files", side_effect=OSError("boom")):
+            i18n.set_language("es")
+            self.assertEqual(
+                i18n.t("Scanning package records in {path}..."),
+                "Scanning package records in {path}...",
+            )
+        with mock.patch("pkgcheck.i18n.files") as mock_files:
+            mock_res = mock.MagicMock()
+            mock_res.read_text.side_effect = json.JSONDecodeError("err", "doc", 0)
+            mock_files.return_value.__truediv__.return_value = mock_res
+            # Need to mock files("pkgcheck") chain
+            with mock.patch("pkgcheck.i18n.files", return_value=mock_res):
+                # Actually simpler: patch json.loads to raise
+                with mock.patch("json.loads", side_effect=json.JSONDecodeError("err", "doc", 0)):
+                    i18n.set_language("es")
+                    self.assertEqual(i18n.t("hello"), "hello")
+
+    def test_is_safe_rel_empty(self) -> None:
+        self.assertFalse(_is_safe_rel(""))
 
 
 if __name__ == "__main__":
