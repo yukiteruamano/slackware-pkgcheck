@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import shutil
 import sys
@@ -23,16 +24,20 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 from rich.prompt import Confirm
+from rich.table import Table
 
 from pkgcheck import __version__
+from pkgcheck.diff import diff_reports, list_logs
 from pkgcheck.i18n import ALL_LANGUAGES, detect_language, is_supported, set_language, t
 from pkgcheck.libdeps import (
     build_library_owner_index,
     check_library_deps,
+    check_library_deps_safe,
     check_undefined_symbols,
     collect_defined_symbols,
     find_missing_owner,
 )
+from pkgcheck.orphans import find_orphans
 from pkgcheck.reporter import (
     BackupIndex,
     BrokenBinary,
@@ -40,6 +45,7 @@ from pkgcheck.reporter import (
     ErrorsIndex,
     MissingIndex,
     NoAccessIndex,
+    OrphansIndex,
     PendingNewIndex,
     Summary,
     UndefinedSymbolsIndex,
@@ -195,6 +201,53 @@ def _build_parser() -> argparse.ArgumentParser:
             languages=", ".join(ALL_LANGUAGES)
         ),
     )
+    parser.add_argument(
+        "--orphans",
+        action="store_true",
+        help=t("Also list orphan (untracked) files not owned by any package."),
+    )
+    parser.add_argument(
+        "--orphans-root",
+        default="/",
+        metavar="DIR",
+        help=t("Root directory for --orphans scan (default: /)."),
+    )
+    parser.add_argument(
+        "--list-logs",
+        action="store_true",
+        help=t("List existing pkgcheck logs and exit."),
+    )
+    parser.add_argument(
+        "--diff",
+        action="store_true",
+        help=t("Diff two JSON logs (requires --from and --to)."),
+    )
+    parser.add_argument(
+        "--from",
+        dest="from_path",
+        default=None,
+        metavar="PATH",
+        help=t("First log for --diff (path or 'latest')."),
+    )
+    parser.add_argument(
+        "--to",
+        dest="to_path",
+        default=None,
+        metavar="PATH",
+        help=t("Second log for --diff (path or 'latest')."),
+    )
+    parser.add_argument(
+        "--safe-ldd",
+        action="store_true",
+        help=t("Use safe readelf -d NEEDED instead of ldd (no execution)."),
+    )
+    parser.add_argument(
+        "--completion",
+        choices=["bash", "zsh", "fish"],
+        default=None,
+        metavar="SHELL",
+        help=t("Generate shell completion script and exit."),
+    )
     elevate_group = parser.add_mutually_exclusive_group()
     elevate_group.add_argument(
         "--elevate",
@@ -214,6 +267,77 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _completion_script(shell: str) -> str:
+    """Returns a shell completion script for `shell`."""
+    flags = [
+        "--packages-dir",
+        "--workers",
+        "--json",
+        "--max-rows",
+        "--exclude",
+        "--backup-suffixes",
+        "--new-suffix",
+        "--check-libs-deps",
+        "--check-libs-symbols",
+        "--safe-ldd",
+        "--quiet",
+        "--lang",
+        "--elevate",
+        "--no-elevate",
+        "--orphans",
+        "--orphans-root",
+        "--list-logs",
+        "--diff",
+        "--from",
+        "--to",
+        "--completion",
+        "--version",
+        "--help",
+    ]
+    joined = " ".join(flags)
+    if shell == "bash":
+        return f"""# bash completion for pkgcheck
+_pkgcheck_completions() {{
+    local cur="${{COMP_WORDS[COMP_CWORD]}}"
+    COMPREPLY=($(compgen -W "{joined}" -- "$cur"))
+}}
+complete -F _pkgcheck_completions pkgcheck
+"""
+    if shell == "zsh":
+        return f"""#compdef pkgcheck
+_arguments "*: :->args"
+_kg() {{ compadd -- {joined} }}
+_kg
+"""
+    if shell == "fish":
+        lines = "\n".join(
+            f"complete -c pkgcheck -l {f.lstrip('-')} -d '{f}'" for f in flags if f.startswith("--")
+        )
+        return f"# fish completion for pkgcheck\n{lines}\n"
+    return ""
+
+
+def _resolve_log_path(value: str | None, log_dir: Path) -> Path | None:
+    """Resolves `value` which may be a path or 'latest' alias."""
+    if value is None:
+        return None
+    if value == "latest":
+        entries = list_logs(log_dir)
+        if not entries:
+            return None
+        return entries[0].path
+    if value.startswith("latest-"):
+        try:
+            idx = int(value.split("-", 1)[1])
+        except ValueError:
+            return Path(value)
+        entries = list_logs(log_dir)
+        if 1 <= idx <= len(entries):
+            return entries[idx - 1].path
+        return Path(value)
+    return Path(value)
+
+
 def main() -> None:
     """Main entry point: validates the environment and starts the analysis."""
     previous_encoding = _ensure_utf8_environment()
@@ -230,6 +354,64 @@ def main() -> None:
 
     parser = _build_parser()
     args = parser.parse_args()
+
+    # Early exits that don't need packages_dir
+    if args.completion:
+        sys.stdout.write(_completion_script(args.completion))
+        return
+
+    if args.list_logs:
+        console = Console()
+        entries = list_logs(_LOG_DIR)
+        if not entries:
+            console.print(t("[yellow]No logs found in {dir}.[/yellow]").format(dir=_LOG_DIR))
+            return
+        table = Table(title=t("pkgcheck logs"))
+        table.add_column("#", justify="right")
+        table.add_column(t("Date"))
+        table.add_column(t("Format"))
+        table.add_column(t("Size"), justify="right")
+        table.add_column(t("Path"))
+        for idx, e in enumerate(entries, 1):
+            dt = datetime.fromtimestamp(e.mtime).strftime("%Y-%m-%d %H:%M:%S")
+            table.add_row(str(idx), dt, e.fmt, f"{e.size:,}", str(e.path))
+        console.print(table)
+        return
+
+    if args.diff:
+        if not args.from_path or not args.to_path:
+            parser.error(t("--diff requires --from and --to"))
+        from_p = _resolve_log_path(args.from_path, _LOG_DIR)
+        to_p = _resolve_log_path(args.to_path, _LOG_DIR)
+        if from_p is None or not from_p.exists():
+            parser.error(t("diff --from path does not exist: {path}").format(path=args.from_path))
+        if to_p is None or not to_p.exists():
+            parser.error(t("diff --to path does not exist: {path}").format(path=args.to_path))
+        try:
+            diff = diff_reports(from_p, to_p)
+        except RuntimeError as exc:
+            console = Console()
+            console.print(t("[red]Error:[/red] {exc}").format(exc=exc))
+            raise SystemExit(1) from None
+        if args.json:
+            sys.stdout.write(json.dumps(diff, indent=2, ensure_ascii=False) + "\n")
+        else:
+            console = Console()
+            if not diff.get("diff"):
+                console.print(t("[green]No differences found.[/green]"))
+            else:
+                for cat, change in diff["diff"].items():
+                    if cat == "summary":
+                        continue
+                    console.print(f"[bold]{cat}[/bold]")
+                    if isinstance(change, dict) and "added" in change:
+                        for pkg, paths in change.get("added", {}).items():
+                            console.print(f"[green]+ {pkg}: {', '.join(paths)}[/green]")
+                        for pkg, paths in change.get("removed", {}).items():
+                            console.print(f"[red]- {pkg}: {', '.join(paths)}[/red]")
+                    else:
+                        console.print(json.dumps(change, indent=2, ensure_ascii=False))
+        return
 
     if args.lang is not None and not is_supported(args.lang):
         parser.error(t("unsupported language: {lang}").format(lang=args.lang))
@@ -265,21 +447,31 @@ def main() -> None:
 
     rg_bin = shutil.which("rg")
     if rg_bin is None:
-        parser.error(
-            t("ripgrep (rg) was not found on the system; install it before using pkgcheck")
+        (status_console if args.json else console).print(
+            t("[yellow]ripgrep (rg) not found, falling back to Python scan (slower).[/yellow]")
         )
 
     if args.check_libs_symbols and not args.check_libs_deps:
         parser.error(t("--check-libs-symbols requires --check-libs-deps"))
 
-    ldd_bin = shutil.which("ldd") if args.check_libs_deps else None
-    if args.check_libs_deps and ldd_bin is None:
+    if args.safe_ldd and not args.check_libs_deps:
+        parser.error(t("--safe-ldd requires --check-libs-deps"))
+
+    if args.orphans:
+        orphans_root = Path(args.orphans_root).expanduser().resolve()
+        if not orphans_root.is_dir():
+            parser.error(t("orphans root does not exist: {path}").format(path=orphans_root))
+
+    ldd_bin = shutil.which("ldd") if args.check_libs_deps and not args.safe_ldd else None
+    if args.check_libs_deps and not args.safe_ldd and ldd_bin is None:
         parser.error(t("ldd was not found on the system; it is required for --check-libs-deps"))
 
-    readelf_bin = shutil.which("readelf") if args.check_libs_symbols else None
-    if args.check_libs_symbols and readelf_bin is None:
+    readelf_bin = shutil.which("readelf") if (args.check_libs_symbols or args.safe_ldd) else None
+    if (args.check_libs_symbols or args.safe_ldd) and readelf_bin is None:
         parser.error(
-            t("readelf was not found on the system; it is required for --check-libs-symbols")
+            t(
+                "readelf was not found on the system; it is required for --check-libs-symbols/--safe-ldd"
+            )
         )
 
     try:
@@ -375,6 +567,7 @@ def _write_auto_log(
     errors_by_package: ErrorsIndex,
     broken_libs: BrokenLibsIndex | None = None,
     undefined_symbols: UndefinedSymbolsIndex | None = None,
+    orphans: OrphansIndex | None = None,
 ) -> Path | None:
     """Writes the automatic log to ``/var/log/pkgcheck``; requires root.
 
@@ -396,6 +589,7 @@ def _write_auto_log(
             when,
             broken_libs,
             undefined_symbols,
+            orphans,
         )
     except OSError as exc:
         console.print(
@@ -412,7 +606,7 @@ def _run(
     status_console: Console,
     args: argparse.Namespace,
     packages_dir: Path,
-    rg_bin: str,
+    rg_bin: str | None,
     ldd_bin: str | None,
     readelf_bin: str | None,
 ) -> None:
@@ -483,11 +677,24 @@ def _run(
 
     broken_libs: BrokenLibsIndex = {}
     undefined_symbols: UndefinedSymbolsIndex = {}
+    orphans: list[str] = []
     broken_count = 0
     missing_lib_count = 0
     undefined_count = 0
+    if args.orphans:
+        owned_set = {f"/{rel}" for _, rel in entries}
+        orphans_root = Path(args.orphans_root).expanduser().resolve()
+        # Use user extra excludes for orphans as well
+        extra_for_orphans = _pseudo_prefixes(args)
+        if not args.quiet:
+            status.print(t("Scanning for orphan files in {path}...").format(path=orphans_root))
+        orphans = find_orphans(owned_set, root=orphans_root, extra_exclude=extra_for_orphans)
     if args.check_libs_deps:
-        assert ldd_bin is not None and elf_flags is not None
+        assert elf_flags is not None
+        if args.safe_ldd:
+            assert readelf_bin is not None
+        else:
+            assert ldd_bin is not None
         elf_entries = [
             (package, rel)
             for (package, rel), is_elf in zip(entries, elf_flags, strict=True)
@@ -501,12 +708,23 @@ def _run(
                 deps_task = progress.add_task(
                     t("Checking library dependencies (ldd)..."), total=len(elf_paths)
                 )
-                missing_per_path = check_library_deps(
-                    elf_paths,
-                    args.workers,
-                    ldd_bin,
-                    on_progress=lambda done: progress.update(deps_task, completed=done),
-                )
+                if args.safe_ldd:
+                    assert readelf_bin is not None
+                    missing_per_path = check_library_deps_safe(
+                        elf_paths,
+                        args.workers,
+                        readelf_bin,
+                        owner_index,
+                        on_progress=lambda done: progress.update(deps_task, completed=done),
+                    )
+                else:
+                    assert ldd_bin is not None
+                    missing_per_path = check_library_deps(
+                        elf_paths,
+                        args.workers,
+                        ldd_bin,
+                        on_progress=lambda done: progress.update(deps_task, completed=done),
+                    )
 
             for (package, rel), missing in zip(elf_entries, missing_per_path, strict=True):
                 if not missing:
@@ -561,6 +779,7 @@ def _run(
         broken_binaries=broken_count,
         missing_libs=missing_lib_count,
         undefined_symbol_binaries=undefined_count,
+        orphans=len(orphans),
     )
 
     if not args.quiet and not args.json:
@@ -600,6 +819,27 @@ def _run(
                 title=t("Binaries with undefined symbols by package"),
                 style="bold yellow",
             )
+        if orphans:
+            # Reuse breakdown but orphans are not per-package
+            from rich.tree import Tree
+
+            console.print()
+            tree = Tree(
+                f"[bold yellow]{'*' * 12} {t('Orphan files (untracked)')} {'*' * 12}[/bold yellow]"
+            )
+            # group orphans under root count
+            branch = tree.add(f"[bold cyan]{t('orphans')} ({len(orphans)})[/bold cyan]")
+            limit = args.max_rows if args.max_rows else len(orphans)
+            for p in orphans[:limit]:
+                branch.add(p)
+            if args.max_rows and len(orphans) > args.max_rows:
+                tree.add(
+                    t("... and {remaining} more files").format(
+                        remaining=len(orphans) - args.max_rows
+                    )
+                )
+            console.print(tree)
+            console.print()
 
     if not args.json:
         print_summary(console, summary, elapsed)
@@ -638,11 +878,25 @@ def _run(
     )
     if args.json and os.geteuid() != 0:
         sys.stdout.write(
-            json_report(summary, *indexes, when, broken_libs or None, undefined_symbols or None)
+            json_report(
+                summary,
+                *indexes,
+                when,
+                broken_libs or None,
+                undefined_symbols or None,
+                orphans or None,
+            )
         )
         return
     log_path = _write_auto_log(
-        status, when, fmt, summary, *indexes, broken_libs or None, undefined_symbols or None
+        status,
+        when,
+        fmt,
+        summary,
+        *indexes,
+        broken_libs or None,
+        undefined_symbols or None,
+        orphans or None,
     )
     if log_path is not None:
         status.print(t("[green]Log saved to:[/green] {path}").format(path=log_path))

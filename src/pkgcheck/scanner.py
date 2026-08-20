@@ -36,7 +36,28 @@ _SECTION_HEADER = re.compile(r"^[A-Z][A-Za-z0-9 _-]*:$")
 
 _INSTALL_PREFIX = "install/"
 
-_PSEUDO_PREFIXES = ("dev/", "sys/", "proc/", "run/", "tmp/", "var/run/")
+# Base pseudo-filesystems / ephemeral paths not worth tracking.
+# Expanded from the original 6 to cover cache, spool, mountpoints and
+# lost+found.  `var/log/packages/` is explicitly *not* excluded even though
+# it lives under `var/log/` (it is the package database itself).
+_PSEUDO_PREFIXES = (
+    "dev/",
+    "sys/",
+    "proc/",
+    "run/",
+    "tmp/",
+    "var/run/",
+    "var/tmp/",
+    "var/cache/",
+    "var/spool/",
+    "var/lock/",
+    "var/log/",
+    "var/lib/slackpkg/",
+    "mnt/",
+    "media/",
+    "srv/",
+    "lost+found/",
+)
 
 _RG_TIMEOUT = 300
 
@@ -57,6 +78,17 @@ def _is_safe_rel(rel: str) -> bool:
         return True
     parts = rel.split("/")
     return ".." not in parts
+
+
+def _is_pseudo(rel: str, pseudo_prefixes: Prefixes) -> bool:
+    """Returns whether `rel` should be counted as pseudo/ephemeral.
+
+    Handles the `var/log/packages/` exception: even though `var/log/` is
+    pseudo, the package database itself lives there and must be tracked.
+    """
+    if rel.startswith("var/log/packages/") or rel == "var/log/packages":
+        return False
+    return rel.startswith(pseudo_prefixes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,9 +160,45 @@ def _is_section_header(rels: list[str], index: int) -> bool:
     return False
 
 
+def _python_scan(packages_dir: Path) -> dict[str, list[str]]:
+    """Fallback when ripgrep is not available: read each package file in Python."""
+    by_package: dict[str, list[str]] = {}
+    try:
+        entries = list(packages_dir.iterdir())
+    except OSError as exc:
+        raise RuntimeError(
+            t("could not scan {path}: {detail}").format(path=packages_dir, detail=exc)
+        ) from exc
+    for pkg_path in entries:
+        if not pkg_path.is_file():
+            continue
+        try:
+            text = pkg_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # Split preserving same semantics as rg multiline match
+        # Reconstruct FILE LIST section manually
+        lines = text.splitlines()
+        rels: list[str] = []
+        in_file_list = False
+        for line in lines:
+            stripped = line.rstrip("\r")
+            if stripped == _FILE_LIST_MARKER:
+                in_file_list = True
+                rels.append(stripped)
+                continue
+            if in_file_list:
+                rels.append(stripped)
+                # crude header detection: if we hit a header, we still collect it
+                # and let the main loop's _is_section_header decide
+        if rels:
+            by_package[pkg_path.name] = rels
+    return by_package
+
+
 def scan_package_files(
     packages_dir: Path,
-    rg_bin: str,
+    rg_bin: str | None,
     pseudo_prefixes: Prefixes = _PSEUDO_PREFIXES,
 ) -> ScanResult:
     """Returns the files registered in ``FILE LIST:`` grouped by package.
@@ -140,34 +208,42 @@ def scan_package_files(
     (``dev/``, ``sys/``, ``proc/``, ``run/``, ``tmp/``...), which never persist on disk,
     are discarded. Later section headers (e.g. ``REQUIRES:``) end the extraction for the
     package, and non-ASCII bytes in names are decoded from their octal ``\\NNN`` escapes.
-    """
-    try:
-        result = subprocess.run(
-            build_rg_command(rg_bin, packages_dir),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            timeout=_RG_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            t("ripgrep timed out scanning {path}").format(path=packages_dir)
-        ) from exc
-    if result.returncode >= 2:
-        detail = result.stderr.strip() or f"exit code {result.returncode}"
-        raise RuntimeError(
-            t("ripgrep could not scan {path}: {detail}").format(path=packages_dir, detail=detail)
-        )
 
-    lines = result.stdout.splitlines()
-    by_package: dict[str, list[str]] = {}
-    for line in lines:
-        if not line:
-            continue
-        package_path, _, rel_path = line.partition(":")
-        by_package.setdefault(Path(package_path).name, []).append(rel_path.rstrip("\r"))
+    If ``rg_bin`` is ``None`` or ripgrep is not available, falls back to a pure-Python
+    scan (slower but functional in minimal containers).
+    """
+    if rg_bin is None:
+        by_package = _python_scan(packages_dir)
+    else:
+        try:
+            result = subprocess.run(
+                build_rg_command(rg_bin, packages_dir),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=_RG_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                t("ripgrep timed out scanning {path}").format(path=packages_dir)
+            ) from exc
+        if result.returncode >= 2:
+            detail = result.stderr.strip() or f"exit code {result.returncode}"
+            raise RuntimeError(
+                t("ripgrep could not scan {path}: {detail}").format(
+                    path=packages_dir, detail=detail
+                )
+            )
+
+        lines = result.stdout.splitlines()
+        by_package = {}
+        for line in lines:
+            if not line:
+                continue
+            package_path, _, rel_path = line.partition(":")
+            by_package.setdefault(Path(package_path).name, []).append(rel_path.rstrip("\r"))
 
     entries: list[PackageFile] = []
     excluded_install = 0
@@ -188,7 +264,7 @@ def scan_package_files(
             if rel_path.startswith(_INSTALL_PREFIX):
                 excluded_install += 1
                 continue
-            if rel_path.startswith(pseudo_prefixes):
+            if _is_pseudo(rel_path, pseudo_prefixes):
                 excluded_pseudo += 1
                 continue
             if not _is_safe_rel(rel_path):

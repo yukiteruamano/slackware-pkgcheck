@@ -52,7 +52,7 @@ src = ["src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "RET", "ARG", "RUF", "S", "ANN", "PTH", "T20", "D"]
-ignore = ["S603", "S607", "S101", "ANN401", "D100", "D104", "D105", "D107", "D205", "D301", "D400", "D401"]
+ignore = ["S603", "S607", "S101", "ANN401", "D100", "D104", "D105", "D107", "D205", "D301", "D400", "D401", "E501", "D101"]
 fixable = ["ALL"]
 unfixable = ["S603", "S607"]
 

@@ -1193,10 +1193,10 @@ class CliParserCoverageTest(unittest.TestCase):
             parser.parse_args(["--version"])
 
     def test_pseudo_prefixes_empty(self) -> None:
+        from pkgcheck.scanner import _PSEUDO_PREFIXES
+
         ns = mock.Mock(exclude=[])
-        self.assertEqual(
-            _pseudo_prefixes(ns), ("dev/", "sys/", "proc/", "run/", "tmp/", "var/run/")
-        )
+        self.assertEqual(_pseudo_prefixes(ns), _PSEUDO_PREFIXES)
 
     def test_backup_suffixes_empty(self) -> None:
         ns = mock.Mock(backup_suffixes=" , ")
@@ -1437,6 +1437,9 @@ class CliRunCoverageTest(unittest.TestCase):
             json=False,
             check_libs_deps=False,
             check_libs_symbols=False,
+            safe_ldd=False,
+            orphans=False,
+            orphans_root="/",
             workers=2,
             max_rows=None,
             exclude=[],
@@ -1842,6 +1845,7 @@ class CliMainCoverageTest(unittest.TestCase):
                     pkgcheck.cli.main()
 
     def test_main_rg_not_found(self) -> None:
+        # Now falls back to Python scan instead of error
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 mock.patch.object(sys, "argv", ["pkgcheck", "--no-elevate", "--packages-dir", tmp]),
@@ -1849,12 +1853,14 @@ class CliMainCoverageTest(unittest.TestCase):
                 mock.patch("pkgcheck.cli._ensure_root"),
                 mock.patch("pkgcheck.cli.Console"),
                 mock.patch("shutil.which", return_value=None),
+                mock.patch("pkgcheck.cli._run") as mock_run,
             ):
-                with self.assertRaises(SystemExit) as cm:
-                    import pkgcheck.cli
+                import pkgcheck.cli
 
-                    pkgcheck.cli.main()
-                self.assertEqual(cm.exception.code, 2)
+                pkgcheck.cli.main()
+                mock_run.assert_called_once()
+                # rg_bin should be None (fallback)
+                self.assertIsNone(mock_run.call_args[0][4])
 
     def test_main_symbols_requires_deps_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2144,6 +2150,266 @@ class I18nCoverageTest(unittest.TestCase):
 
     def test_is_safe_rel_empty(self) -> None:
         self.assertFalse(_is_safe_rel(""))
+
+
+class OrphansTest(unittest.TestCase):
+    def test_is_orphan_excluded(self) -> None:
+        from pkgcheck.orphans import _is_orphan_excluded
+
+        self.assertTrue(_is_orphan_excluded("var/log/syslog"))
+        self.assertTrue(_is_orphan_excluded("var/log/packages/foo"))
+        self.assertTrue(_is_orphan_excluded("var/log/packages", ()))
+        self.assertTrue(_is_orphan_excluded("home/user/file"))
+        self.assertFalse(_is_orphan_excluded("usr/bin/foo"))
+        self.assertTrue(_is_orphan_excluded("usr/bin/foo", ("usr/bin/",)))
+
+    def test_find_orphans(self) -> None:
+        from pkgcheck.orphans import find_orphans
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "usr").mkdir()
+            (root / "usr" / "bin").mkdir(parents=True)
+            (root / "usr" / "bin" / "owned").write_text("x")
+            (root / "usr" / "bin" / "orphan").write_text("y")
+            (root / "var").mkdir()
+            (root / "var" / "log").mkdir(parents=True)
+            (root / "var" / "log" / "syslog").write_text("log")
+            owned = {"/usr/bin/owned"}
+            # Use extra_exclude to avoid scanning var/log
+            orphans = find_orphans(owned, root=root, extra_exclude=())
+            self.assertIn(f"{root}/usr/bin/orphan".replace("//", "/"), orphans)
+            # var/log/syslog should be excluded via default
+            self.assertNotIn(f"{root}/var/log/syslog".replace("//", "/"), str(orphans))
+
+    def test_find_orphans_prunes_dir(self) -> None:
+        from pkgcheck.orphans import find_orphans
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "mnt").mkdir()
+            (root / "mnt" / "disk").mkdir(parents=True)
+            (root / "mnt" / "disk" / "file").write_text("x")
+            orphans = find_orphans(set(), root=root)
+            # mnt should be pruned
+            self.assertEqual(orphans, [])
+
+
+class DiffTest(unittest.TestCase):
+    def test_list_logs_empty(self) -> None:
+        from pkgcheck.diff import list_logs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(list_logs(Path(tmp)), [])
+
+    def test_list_logs_sorted(self) -> None:
+        import time
+
+        from pkgcheck.diff import list_logs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p1 = Path(tmp) / "pkgcheck-01-01-2026-00-00-00.log"
+            p2 = Path(tmp) / "pkgcheck-01-01-2026-00-00-01.json"
+            p1.write_text("a")
+            time.sleep(0.01)
+            p2.write_text("{}")
+            entries = list_logs(Path(tmp))
+            self.assertEqual(entries[0].path, p2)
+            self.assertEqual(entries[0].fmt, "json")
+
+    def test_diff_requires_json(self) -> None:
+        from pkgcheck.diff import diff_reports
+
+        with tempfile.TemporaryDirectory() as tmp:
+            a = Path(tmp) / "a.log"
+            b = Path(tmp) / "b.json"
+            a.write_text("x")
+            b.write_text("{}")
+            with self.assertRaises(RuntimeError):
+                diff_reports(a, b)
+
+    def test_diff_reports(self) -> None:
+        from pkgcheck.diff import diff_reports
+
+        with tempfile.TemporaryDirectory() as tmp:
+            a = Path(tmp) / "a.json"
+            b = Path(tmp) / "b.json"
+            a.write_text(json.dumps({"missing": {"pkg": ["/a"]}, "summary": {"missing": 1}}))
+            b.write_text(json.dumps({"missing": {"pkg": ["/a", "/b"]}, "summary": {"missing": 2}}))
+            diff = diff_reports(a, b)
+            self.assertIn("missing", diff["diff"])
+            self.assertIn("added", diff["diff"]["missing"])
+            self.assertEqual(diff["diff"]["missing"]["added"]["pkg"], ["/b"])
+
+    def test_diff_broken_libs(self) -> None:
+        from pkgcheck.diff import diff_reports
+
+        with tempfile.TemporaryDirectory() as tmp:
+            a = Path(tmp) / "a.json"
+            b = Path(tmp) / "b.json"
+            a.write_text(json.dumps({"broken_libs": {"pkg": []}}))
+            b.write_text(
+                json.dumps({"broken_libs": {"pkg": [{"binary": "/bin/x", "missing": ["lib.so"]}]}})
+            )
+            diff = diff_reports(a, b)
+            self.assertIn("broken_libs", diff["diff"])
+
+
+class ScannerFallbackTest(unittest.TestCase):
+    def test_python_scan_fallback(self) -> None:
+        from pkgcheck.scanner import _python_scan
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg_dir = Path(tmp)
+            (pkg_dir / "pkg-1.0").write_text("FILE LIST:\nusr/bin/foo\n")
+            by_pkg = _python_scan(pkg_dir)
+            self.assertIn("pkg-1.0", by_pkg)
+            self.assertIn("usr/bin/foo", by_pkg["pkg-1.0"])
+
+    def test_scan_with_none_uses_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg_dir = Path(tmp)
+            (pkg_dir / "pkg-1.0").write_text("FILE LIST:\nusr/bin/foo\nvar/log/syslog\n")
+            result = scan_package_files(pkg_dir, None)
+            # var/log/syslog should be excluded as pseudo
+            self.assertIn(("pkg-1.0", "usr/bin/foo"), result.entries)
+            self.assertNotIn(("pkg-1.0", "var/log/syslog"), result.entries)
+
+    def test_is_pseudo_var_log_packages(self) -> None:
+        from pkgcheck.scanner import _is_pseudo
+
+        self.assertFalse(_is_pseudo("var/log/packages/foo", ("var/log/",)))
+        self.assertTrue(_is_pseudo("var/log/syslog", ("var/log/",)))
+        self.assertFalse(_is_pseudo("var/log/packages", ("var/log/",)))
+
+
+class SafeLddTest(unittest.TestCase):
+    def test_needed_via_readelf(self) -> None:
+        from pkgcheck.libdeps import _needed_libs_via_readelf
+
+        output = " 0x00000001 (NEEDED)                     Shared library: [libfoo.so.1]\n 0x00000001 (NEEDED)                     Shared library: [libbar.so.2]\n"
+        with mock.patch(
+            "pkgcheck.libdeps.subprocess.run",
+            return_value=types.SimpleNamespace(stdout=output, stderr=""),
+        ):
+            missing = _needed_libs_via_readelf("/bin/foo", "readelf", {"libfoo.so.1": "pkg-a"})
+            self.assertEqual(missing, ["libbar.so.2"])
+
+    def test_needed_via_readelf_timeout(self) -> None:
+        from pkgcheck.libdeps import _needed_libs_via_readelf
+
+        with mock.patch(
+            "pkgcheck.libdeps.subprocess.run", side_effect=subprocess.TimeoutExpired("readelf", 60)
+        ):
+            self.assertEqual(_needed_libs_via_readelf("/bin/foo", "readelf", {}), [])
+
+    def test_check_library_deps_safe(self) -> None:
+        from pkgcheck.libdeps import check_library_deps_safe
+
+        with mock.patch("pkgcheck.libdeps._needed_libs_via_readelf", side_effect=[["liba.so"], []]):
+            result = check_library_deps_safe(
+                ["/a", "/b"], workers=2, readelf_bin="readelf", owner_index={}
+            )
+            self.assertEqual(result, [["liba.so"], []])
+
+
+class CompletionTest(unittest.TestCase):
+    def test_completion_scripts(self) -> None:
+        from pkgcheck.cli import _completion_script
+
+        for shell in ["bash", "zsh", "fish"]:
+            script = _completion_script(shell)
+            self.assertIn("pkgcheck", script)
+        self.assertEqual(_completion_script("unknown"), "")
+
+
+class ListLogsDiffCliTest(unittest.TestCase):
+    def test_list_logs_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_dir = Path(tmp)
+            (fake_dir / "pkgcheck-01-01-2026-00-00-00.json").write_text("{}")
+            with (
+                mock.patch.object(sys, "argv", ["pkgcheck", "--list-logs"]),
+                mock.patch("pkgcheck.cli._LOG_DIR", fake_dir),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli.Console") as MockConsole,
+            ):
+                mock_console = mock.MagicMock()
+                MockConsole.return_value = mock_console
+                import pkgcheck.cli
+
+                pkgcheck.cli.main()
+                self.assertTrue(mock_console.print.called)
+
+    def test_diff_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            a = Path(tmp) / "a.json"
+            b = Path(tmp) / "b.json"
+            a.write_text(json.dumps({"missing": {"pkg": ["/a"]}}))
+            b.write_text(json.dumps({"missing": {"pkg": ["/b"]}}))
+            with (
+                mock.patch.object(
+                    sys, "argv", ["pkgcheck", "--diff", "--from", str(a), "--to", str(b)]
+                ),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli.Console") as MockConsole,
+            ):
+                mock_console = mock.MagicMock()
+                MockConsole.return_value = mock_console
+                import pkgcheck.cli
+
+                pkgcheck.cli.main()
+                self.assertTrue(mock_console.print.called)
+
+    def test_orphans_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg_dir = Path(tmp) / "pkgs"
+            pkg_dir.mkdir()
+            (pkg_dir / "pkg-1.0").write_text("FILE LIST:\nusr/bin/owned\n")
+            root = Path(tmp) / "root"
+            root.mkdir()
+            (root / "usr").mkdir(parents=True)
+            (root / "usr" / "bin").mkdir(parents=True)
+            (root / "usr" / "bin" / "owned").write_text("x")
+            (root / "usr" / "bin" / "orphan").write_text("y")
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "pkgcheck",
+                        "--orphans",
+                        "--orphans-root",
+                        str(root),
+                        "--no-elevate",
+                        "--packages-dir",
+                        str(pkg_dir),
+                    ],
+                ),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_root"),
+                mock.patch("shutil.which", return_value="/usr/bin/rg"),
+                mock.patch("pkgcheck.cli._LOG_DIR", Path(tmp)),
+                mock.patch("os.geteuid", return_value=0),
+                mock.patch("pkgcheck.cli.Console") as MockConsole,
+            ):
+                MockConsole.return_value = mock.MagicMock()
+                import pkgcheck.cli
+
+                pkgcheck.cli.main()
+                # should succeed without SystemExit
+                self.assertTrue(True)
+
+    def test_completion_cli(self) -> None:
+        with (
+            mock.patch.object(sys, "argv", ["pkgcheck", "--completion", "bash"]),
+            mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+            mock.patch("sys.stdout", new=io.StringIO()) as fake_out,
+        ):
+            import pkgcheck.cli
+
+            pkgcheck.cli.main()
+            self.assertIn("bash", fake_out.getvalue())
 
 
 if __name__ == "__main__":

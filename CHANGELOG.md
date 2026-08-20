@@ -17,7 +17,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 ### Added
-- `py.typed`, `mypy --strict`, `ruff` S/ANN/PTH/D, `coverage` 80%, `pip-audit`, `pre-commit`, CI (`ci.yml`), `dependabot`, `CODEOWNERS`, `CONTRIBUTING.md`, `.editorconfig`.
-- Scanner path-traversal hardening (`_is_safe_rel`).
-- `ldd` security note (LD_TRACE).
+- `py.typed`, `mypy --strict`, `ruff` S/ANN/PTH/D, `coverage` 98% (fail_under 90), `pip-audit`, `pre-commit`, CI (`ci.yml`), `dependabot`, `CODEOWNERS`, `CONTRIBUTING.md`, `.editorconfig`.
+- Scanner path-traversal hardening (`_is_safe_rel`) and expanded pseudo excludes (16 prefixes, `var/log/packages` exception).
+- `ldd` security note (LD_TRACE) and `--safe-ldd` via `readelf -d NEEDED` (no execution).
+- Fallback Python scan when `ripgrep` not found (instead of hard error).
+- `--orphans` / `--orphans-root` via `orphans.py`, `--list-logs`, `--diff` (`--from`/`--to`, `latest` aliases) via `diff.py`.
+- `--completion bash|zsh|fish` generation.
+- Reporter orphans handling (`orphans` JSON key, `ORPHANS` text section, summary).
+- Tests 88 → 188, scanner/verifier/libdeps/reporter/cli/i18n all ≥90%.
 

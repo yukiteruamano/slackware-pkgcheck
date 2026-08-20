@@ -46,6 +46,9 @@ _LIB_PREFIXES = ("usr/lib/", "usr/lib64/", "lib/", "lib64/", "usr/libexec/")
 
 _LDD_TIMEOUT = 60
 
+# Safe mode: NEEDED entries from `readelf -d`
+_NEEDED = re.compile(r"\(NEEDED\)[^[]*\[([^\]]+)\]")
+
 type ProgressCallback = Callable[[int], None]
 type LibEntries = Iterable[tuple[str, str]]
 
@@ -99,6 +102,34 @@ def _missing_libs_of(path: str, ldd_bin: str) -> list[str]:
     return missing
 
 
+def _needed_libs_via_readelf(path: str, readelf_bin: str, owner_index: dict[str, str]) -> list[str]:
+    """Safe alternative to `ldd`: uses `readelf -d` NEEDED and owner index.
+
+    Does not execute the binary. A needed library is considered missing if its
+    basename is not provided by any installed package (best-effort).
+    """
+    try:
+        result = subprocess.run(
+            [readelf_bin, "-d", path],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=_LDD_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    # readelf -d failures (not ELF, etc.) return non-zero but still output empty
+    needed: list[str] = []
+    for match in _NEEDED.finditer(result.stdout):
+        lib = match.group(1)
+        if lib not in needed:
+            needed.append(lib)
+    # Filter to those not provided by any installed package
+    return [lib for lib in needed if lib not in owner_index]
+
+
 def check_library_deps(
     paths: Iterable[str],
     workers: int,
@@ -118,6 +149,41 @@ def check_library_deps(
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pkgcheck-ldd") as executor:
         for index, path in enumerate(paths):
             futures[executor.submit(_missing_libs_of, path, ldd_bin)] = index
+        last_update = time.monotonic()
+        for done, future in enumerate(as_completed(futures), start=1):
+            index = futures[future]
+            try:
+                results[index] = future.result()
+            except Exception:
+                results[index] = []
+            if on_progress is not None and _should_report(done, len(paths), last_update):
+                on_progress(done)
+                last_update = time.monotonic()
+    return results
+
+
+def check_library_deps_safe(
+    paths: Iterable[str],
+    workers: int,
+    readelf_bin: str,
+    owner_index: dict[str, str],
+    on_progress: ProgressCallback | None = None,
+) -> list[list[str]]:
+    """Safe `readelf -d` variant of :func:`check_library_deps` (no execution).
+
+    Checks NEEDED entries against `owner_index`; a library is reported missing
+    if no installed package provides it.
+    """
+    paths = list(paths)
+    results: list[list[str]] = [[] for _ in paths]
+    futures: dict[Future[Any], int] = {}
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="pkgcheck-ldd-safe"
+    ) as executor:
+        for index, path in enumerate(paths):
+            futures[executor.submit(_needed_libs_via_readelf, path, readelf_bin, owner_index)] = (
+                index
+            )
         last_update = time.monotonic()
         for done, future in enumerate(as_completed(futures), start=1):
             index = futures[future]

@@ -19,6 +19,7 @@ type NoAccessIndex = dict[str, list[str]]
 type BackupIndex = dict[str, list[str]]
 type PendingNewIndex = dict[str, list[str]]
 type ErrorsIndex = dict[str, list[str]]
+type OrphansIndex = list[str]
 
 
 # A single broken binary: its missing shared libraries and (best-effort) which
@@ -71,6 +72,7 @@ class Summary:
     broken_binaries: int = 0
     missing_libs: int = 0
     undefined_symbol_binaries: int = 0
+    orphans: int = 0
 
 
 def print_summary(console: Console, summary: Summary, elapsed: float) -> None:
@@ -114,6 +116,11 @@ def print_summary(console: Console, summary: Summary, elapsed: float) -> None:
         table.add_row(
             t("Binaries with undefined symbols"),
             f"[yellow]{summary.undefined_symbol_binaries:,}[/yellow]",
+        )
+    if summary.orphans:
+        table.add_row(
+            t("Orphan files"),
+            f"[yellow]{summary.orphans:,}[/yellow]",
         )
     table.add_row(t("Total time"), f"{elapsed:.2f}s")
 
@@ -200,6 +207,7 @@ def write_report(
     when: datetime | None = None,
     broken_libs: BrokenLibsIndex | None = None,
     undefined_symbols: UndefinedSymbolsIndex | None = None,
+    orphans: OrphansIndex | None = None,
 ) -> None:
     """Writes the report to `output`; the format depends on the extension (.json/.log)."""
     if output.suffix.lower() == ".json":
@@ -214,6 +222,7 @@ def write_report(
                 when,
                 broken_libs,
                 undefined_symbols,
+                orphans,
             )
         )
     else:
@@ -228,6 +237,7 @@ def write_report(
                 when,
                 broken_libs,
                 undefined_symbols,
+                orphans,
             )
         )
 
@@ -242,6 +252,7 @@ def json_report(
     when: datetime | None = None,
     broken_libs: BrokenLibsIndex | None = None,
     undefined_symbols: UndefinedSymbolsIndex | None = None,
+    orphans: OrphansIndex | None = None,
 ) -> str:
     """Returns the full report as a JSON document."""
     data = {
@@ -268,6 +279,8 @@ def json_report(
         }
     if undefined_symbols:
         data["undefined_symbols"] = undefined_symbols
+    if orphans:
+        data["orphans"] = orphans
     if when is not None:
         data["timestamp"] = when.isoformat()
     return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
@@ -283,6 +296,7 @@ def _text_report(
     when: datetime | None = None,
     broken_libs: BrokenLibsIndex | None = None,
     undefined_symbols: UndefinedSymbolsIndex | None = None,
+    orphans: OrphansIndex | None = None,
 ) -> str:
     header = t("pkgcheck v{version} — Missing files by package").format(version=__version__)
     if when is not None:
@@ -330,6 +344,8 @@ def _text_report(
                 count=f"{summary.undefined_symbol_binaries:,}"
             )
         )
+    if summary.orphans:
+        summary_lines.append(t("Orphan files: {count}").format(count=f"{summary.orphans:,}"))
     lines = [
         header,
         "=" * 46,
@@ -381,5 +397,10 @@ def _text_report(
         for package, binaries in sorted(undefined_symbols.items()):
             for binary, symbols in binaries.items():
                 lines.append(f"{package}\t{binary}\t{', '.join(symbols)}")
+
+    if orphans:
+        _text_section(lines, t("ORPHANS (untracked files):"))
+        for path in sorted(orphans):
+            lines.append(path)
 
     return "\n".join(lines) + "\n"

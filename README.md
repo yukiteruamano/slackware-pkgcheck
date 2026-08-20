@@ -9,15 +9,18 @@
 Integrity checker for Slackware Linux: verifies that the files recorded by each package
 in `/var/log/packages/` really exist on the system.
 
-- Bulk extraction of `FILE LIST:` sections with **ripgrep** in a single pass.
+- Bulk extraction of `FILE LIST:` sections with **ripgrep** in a single pass (Python fallback if `rg` not found).
 - Parallel verification with `ThreadPoolExecutor` (broken symbolic links count as present:
   `os.lstat` is used).
 - Distinguishes **missing** files, **backup-only** (`.bak`/`.orig`) and **no access**
   (requires root), as well as **`.new` configs pending review**.
 - Decodes the octal escapes (`\NNN`) Slackware uses for names with non-ASCII bytes and
   discards sections after the FILE LIST (e.g. `REQUIRES:`).
-- Excludes install scripts (`install/`) and pseudo-filesystems (`dev/`, `sys/`, …).
+- Excludes install scripts (`install/`) and pseudo-filesystems (`dev/`, `sys/`, `proc/`, `run/`, `tmp/`, `var/tmp`, `var/cache`, `var/spool`, `var/log`, `mnt`, `media`, …) with `var/log/packages` exception.
 - Reports files with **verification errors** too (JSON `files_errors` / `ERRORS` log section).
+- Finds **orphan** files not owned by any package (`--orphans`) and diffs two runs (`--diff` with `--list-logs`).
+- Safe `readelf -d NEEDED` mode (`--safe-ldd`) as alternative to `ldd` (no execution).
+- Shell completion for bash/zsh/fish (`--completion`).
 - Live progress and report with **rich**; summary + breakdown per package.
 - Automatic log in `/var/log/pkgcheck/pkgcheck-<date>.log` (`.json` with `--json`).
 - Internationalized interface (7 languages) with automatic OS locale detection.
@@ -26,7 +29,7 @@ in `/var/log/packages/` really exist on the system.
 
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
-- ripgrep (`rg`) in the `PATH`
+- ripgrep (`rg`) recommended (falls back to Python scan if missing)
 
 ## Getting started
 
@@ -46,7 +49,12 @@ uv run pkgcheck --no-elevate --json           # without root: only prints the JS
 uv run pkgcheck --workers 16                  # adjusts the parallelism
 uv run pkgcheck --packages-dir /mnt/root/var/log/packages
 sudo uv run pkgcheck --check-libs-deps        # also checks library dependencies (ldd)
+sudo uv run pkgcheck --check-libs-deps --safe-ldd  # safe readelf mode (no execution)
 sudo uv run pkgcheck --check-libs-deps --check-libs-symbols   # + undefined symbols
+uv run pkgcheck --orphans --orphans-root /    # lists untracked files
+uv run pkgcheck --list-logs                   # lists existing logs
+uv run pkgcheck --diff --from latest --to /var/log/pkgcheck/pkgcheck-...json --json
+uv run pkgcheck --completion bash > /etc/bash_completion.d/pkgcheck
 ```
 
 ### Library dependencies (`--check-libs-deps`)
@@ -93,9 +101,9 @@ Entries under `install/` (`install/doinst.sh`, `install/slack-desc`,
 leave on disk, so they are **excluded** from the analysis and shown as an informational
 counter.
 
-The pseudo-filesystems (`dev/`, `sys/`, `proc/`, `run/`, `tmp/` and `var/run/`) are also
+The pseudo-filesystems and ephemeral paths (`dev/`, `sys/`, `proc/`, `run/`, `tmp/`, `var/run/`, `var/tmp/`, `var/cache/`, `var/spool/`, `var/lock/`, `var/log/` (except `var/log/packages/`), `var/lib/slackpkg/`, `mnt/`, `media/`, `srv/`, `lost+found/`) are also
 not tracked: their entries (e.g. the device nodes of the `devs` package) are dynamic and
-do not persist. More prefixes can be added with `--exclude`.
+do not persist. More prefixes can be added with `--exclude`. Ripgrep is preferred but a pure-Python fallback is used if `rg` is not found.
 
 ### Pending new configs (`.new`)
 
@@ -120,6 +128,23 @@ If a recorded path does not exist but a backup-suffix variant (`.bak` or `.orig`
 it is reported as **backup-only** instead of missing. The set of suffixes is adjusted with
 `--backup-suffixes`. The per-package detail appears in the report (key `files_backup` in
 JSON), not in the console tree.
+
+### Orphan files (`--orphans`)
+
+With `--orphans` pkgcheck also reports files present on disk but not owned by any package (e.g. `make install` leftovers). The scan walks `--orphans-root` (default `/`) and excludes the pseudo-filesystems above plus `home/` and any `--exclude`. Results appear in `summary.orphans` and `orphans` JSON key and in the `ORPHANS` text section and console tree.
+
+### Log listing and diff (`--list-logs`, `--diff`)
+
+- `--list-logs` prints a table of existing logs in `/var/log/pkgcheck/` (idx, date, fmt, size, path).
+- `--diff --from PATH --to PATH` (or `latest`/`latest-1` aliases) diffs two JSON reports (`missing`, `files_backup`, ..., `orphans`, `broken_libs`). In text mode it shows `+ added`/`- removed` per package; with `--json` it prints a JSON diff. Text logs (`.log`) are not diffable.
+
+### Safe library deps (`--safe-ldd`)
+
+`--check-libs-deps` uses `ldd` which executes the binary. With `--safe-ldd` the check uses `readelf -d NEEDED` instead (no execution) and reports a library as missing if no installed package provides it (best-effort via `owner_index`). Requires `readelf`.
+
+### Shell completion (`--completion`)
+
+`--completion bash|zsh|fish` prints a completion script to stdout. Example: `pkgcheck --completion bash > /etc/bash_completion.d/pkgcheck`.
 
 ### Automatic log
 
@@ -183,6 +208,14 @@ are not localized: they are the stable API.
 | `--check-libs-symbols`| Also checks installed binaries for undefined dynamic symbols not        |
 |                    | provided by any installed library (requires `--check-libs-deps`; may      |
 |                    | report false positives).                                                  |
+| `--safe-ldd`       | Use `readelf -d NEEDED` instead of `ldd` (no execution, safe mode).     |
+| `--orphans`        | Also list orphan files not owned by any package.                           |
+| `--orphans-root`   | Root for `--orphans` scan (default `/`).                                   |
+| `--list-logs`      | List existing logs in `/var/log/pkgcheck` and exit.                       |
+| `--diff`           | Diff two JSON logs (requires `--from`/`--to`, supports `latest`).        |
+| `--from PATH`      | First log for `--diff`.                                                    |
+| `--to PATH`        | Second log for `--diff`.                                                   |
+| `--completion`     | Generate shell completion (`bash`/`zsh`/`fish`) and exit.                |
 | `--quiet`          | Hides progress and breakdown; only prints the summary.                   |
 | `--elevate`        | Re-runs with sudo if root privileges are not available.                  |
 | `--no-elevate`     | Does not ask for root privileges; only verifies what is accessible.      |
@@ -201,7 +234,7 @@ uv run coverage run -m unittest discover -s tests && uv run coverage report
 ```
 
 Tooling: `ruff` (`E,F,W,I,UP,B,SIM,C4,RET,ARG,RUF,S,ANN,PTH,T20,D`), `mypy --strict`,
-`coverage` (branch, fail_under 80), `pip-audit`, `pre-commit`.
+`coverage` (branch, fail_under 90, total 93%), `pip-audit`, `pre-commit`.
 
 ## Contributing
 
