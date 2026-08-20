@@ -16,6 +16,7 @@ is intentionally heuristic and can yield false positives (lazy binding,
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import time
@@ -81,13 +82,14 @@ def _missing_libs_of(path: str, ldd_bin: str) -> list[str]:
     """Runs `ldd` on `path` and returns the list of missing shared libraries."""
     try:
         result = subprocess.run(
-            [ldd_bin, path],
+            [ldd_bin, "--", path],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             check=False,
             timeout=_LDD_TIMEOUT,
+            env={**os.environ, "LC_ALL": "C"},
         )
     except (OSError, subprocess.TimeoutExpired):
         return []
@@ -106,17 +108,19 @@ def _needed_libs_via_readelf(path: str, readelf_bin: str, owner_index: dict[str,
     """Safe alternative to `ldd`: uses `readelf -d` NEEDED and owner index.
 
     Does not execute the binary. A needed library is considered missing if its
-    basename is not provided by any installed package (best-effort).
+    basename is not provided by any installed package (best-effort, handles
+    versioned sonames: ``libfoo.so.1`` satisfies ``libfoo.so.1.2`` and vice-versa).
     """
     try:
         result = subprocess.run(
-            [readelf_bin, "-d", path],
+            [readelf_bin, "-d", "--", path],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             check=False,
             timeout=_LDD_TIMEOUT,
+            env={**os.environ, "LC_ALL": "C"},
         )
     except (OSError, subprocess.TimeoutExpired):
         return []
@@ -126,8 +130,31 @@ def _needed_libs_via_readelf(path: str, readelf_bin: str, owner_index: dict[str,
         lib = match.group(1)
         if lib not in needed:
             needed.append(lib)
-    # Filter to those not provided by any installed package
-    return [lib for lib in needed if lib not in owner_index]
+    # Filter to those not provided by any installed package (handle versioned sonames)
+    missing: list[str] = []
+    for lib in needed:
+        if lib in owner_index:
+            continue
+        # Check if any owner provides a version-compatible soname
+        # e.g. needed libssl.so.3, owner libssl.so.3.1.0 -> owner startswith needed
+        # also needed libssl.so.3.1.0, owner libssl.so.3 -> needed startswith owner
+        found = False
+        for owner_lib in owner_index:
+            if owner_lib.startswith(lib) or lib.startswith(owner_lib):
+                found = True
+                break
+            # Also check major soname (libfoo.so.1)
+            if ".so." in lib and ".so." in owner_lib:
+                lib_base = lib.split(".so.")[0] + ".so." + lib.split(".so.")[1].split(".")[0]
+                owner_base = (
+                    owner_lib.split(".so.")[0] + ".so." + owner_lib.split(".so.")[1].split(".")[0]
+                )
+                if lib_base == owner_base:
+                    found = True
+                    break
+        if not found:
+            missing.append(lib)
+    return missing
 
 
 def check_library_deps(
@@ -199,7 +226,8 @@ def check_library_deps_safe(
 
 def _is_library_path(rel: str) -> bool:
     """Returns whether `rel` looks like a shared library path."""
-    return rel.startswith(_LIB_PREFIXES) and (".so" in Path(rel).name)
+    name = Path(rel).name
+    return rel.startswith(_LIB_PREFIXES) and (name.endswith(".so") or ".so." in name)
 
 
 def build_library_owner_index(entries: LibEntries) -> dict[str, str]:
@@ -226,20 +254,21 @@ def _readelf_symbols(path: str, readelf_bin: str) -> set[str] | None:
     """Returns the set of defined (exported) dynamic symbols of `path`, or None."""
     try:
         result = subprocess.run(
-            [readelf_bin, "-Ws", path],
+            [readelf_bin, "-Ws", "--", path],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             check=False,
             timeout=_LDD_TIMEOUT,
+            env={**os.environ, "LC_ALL": "C"},
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
     symbols: set[str] = set()
     for line in result.stdout.splitlines():
         match = _DEFINED_SYMBOL.match(line)
-        if match and match.group(1) != "UND":
+        if match:
             symbols.add(match.group(1))
     return symbols
 
@@ -248,13 +277,14 @@ def _undefined_symbols(path: str, defined_globally: set[str], readelf_bin: str) 
     """Returns the undefined symbols of `path` that are not defined anywhere."""
     try:
         result = subprocess.run(
-            [readelf_bin, "-Ws", path],
+            [readelf_bin, "-Ws", "--", path],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             check=False,
             timeout=_LDD_TIMEOUT,
+            env={**os.environ, "LC_ALL": "C"},
         )
     except (OSError, subprocess.TimeoutExpired):
         return []

@@ -8,6 +8,7 @@ which allows grouping by package at no extra cost.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -71,13 +72,14 @@ def _is_safe_rel(rel: str) -> bool:
     escape the filesystem root when later joined as ``f"/{rel}"``. Slackware
     records never contain ``..`` but third-party packages could.
     """
-    if not rel or rel.startswith("/") or rel.startswith("//"):
+    if not rel or rel.startswith("/"):
         return False
-    # Fast path: common traversal marker
-    if ".." not in rel:
-        return True
+    # Reject empty segments (//), current dir (./) and traversal (..) in any position
     parts = rel.split("/")
-    return ".." not in parts
+    for p in parts:
+        if p in ("", ".", ".."):
+            return False
+    return True
 
 
 def _is_pseudo(rel: str, pseudo_prefixes: Prefixes) -> bool:
@@ -224,10 +226,15 @@ def scan_package_files(
                 errors="replace",
                 check=False,
                 timeout=_RG_TIMEOUT,
+                env={**os.environ, "LC_ALL": "C"},
             )
-        except subprocess.TimeoutExpired as exc:
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            if isinstance(exc, subprocess.TimeoutExpired):
+                raise RuntimeError(
+                    t("ripgrep timed out scanning {path}").format(path=packages_dir)
+                ) from exc
             raise RuntimeError(
-                t("ripgrep timed out scanning {path}").format(path=packages_dir)
+                t("ripgrep could not scan {path}: {detail}").format(path=packages_dir, detail=exc)
             ) from exc
         if result.returncode >= 2:
             detail = result.stderr.strip() or f"exit code {result.returncode}"

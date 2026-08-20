@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from enum import Enum
 from functools import partial
+from pathlib import Path
 from typing import Any, cast
 
 _DEFAULT_BACKUP_SUFFIXES = (".bak", ".orig")
@@ -72,13 +73,22 @@ def check_path(
             return PathStatus.NEW_PENDING
         return PathStatus.EXISTS
 
-    if _lexists(path + new_suffix):
-        return PathStatus.NEW_PENDING
-    if path.endswith(new_suffix) and _lexists(path[: -len(new_suffix)]):
-        return PathStatus.EXISTS
+    try:
+        if _lexists(path + new_suffix):
+            return PathStatus.NEW_PENDING
+    except PermissionError:
+        return PathStatus.NO_ACCESS
+    try:
+        if path.endswith(new_suffix) and _lexists(path[: -len(new_suffix)]):
+            return PathStatus.EXISTS
+    except PermissionError:
+        return PathStatus.NO_ACCESS
     for suffix in backup_suffixes:
-        if _lexists(path + suffix):
-            return PathStatus.BACKUP
+        try:
+            if _lexists(path + suffix):
+                return PathStatus.BACKUP
+        except PermissionError:
+            return PathStatus.NO_ACCESS
     return PathStatus.MISSING
 
 
@@ -86,6 +96,8 @@ def _lexists(path: str) -> bool:
     """Returns whether `path` exists without following links (broken links count)."""
     try:
         os.lstat(path)
+    except PermissionError:
+        raise
     except OSError:
         return False
     return True
@@ -99,7 +111,8 @@ def _is_elf_candidate(st_mode: int, path: str) -> bool:
     """
     if st_mode & 0o111:
         return True
-    return ".so" in path
+    name = Path(path).name
+    return name.endswith(".so") or ".so." in name
 
 
 def _is_elf(path: str) -> bool:
@@ -111,21 +124,40 @@ def _is_elf(path: str) -> bool:
     for a FIFO between the stat and the open (TOCTOU).
     """
     try:
-        st = os.stat(path)
-    except OSError:
-        return False
-    if not stat.S_ISREG(st.st_mode):
-        return False
-    if not _is_elf_candidate(st.st_mode, path):
-        return False
-    try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError:
         return False
     try:
-        with os.fdopen(fd, "rb", closefd=True) as handle:
-            return handle.read(4) == _ELF_MAGIC
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return False
+        if not stat.S_ISREG(st.st_mode):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return False
+        if not _is_elf_candidate(st.st_mode, path):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return False
+        try:
+            with os.fdopen(fd, "rb", closefd=True) as handle:
+                return handle.read(4) == _ELF_MAGIC
+        except OSError:
+            return False
     except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         return False
 
 
@@ -161,12 +193,24 @@ def _run_workers(
     paths = list(paths)
     total = len(paths)
     results: list[object] = [None] * total
-    window = max(workers * 2, 64)
+    window = min(max(workers * 2, 64), 1024)
     in_flight: dict[Future[Any], int] = {}
-    last_update = time.monotonic()
+    last_update = 0.0
     done = 0
     index = 0
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pkgcheck") as executor:
+    try:
+        executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pkgcheck")
+    except (OSError, ValueError, RuntimeError):
+        # Fallback to synchronous if threads cannot be created
+        for idx, p in enumerate(paths):
+            try:
+                results[idx] = worker(p)
+            except Exception:
+                results[idx] = None
+            if on_progress is not None:
+                on_progress(idx + 1)
+        return results
+    with executor:
         while index < total or in_flight:
             while index < total and len(in_flight) < window:
                 in_flight[executor.submit(worker, paths[index])] = index

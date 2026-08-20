@@ -35,14 +35,14 @@ def list_logs(log_dir: Path) -> list[LogEntry]:
         except OSError:
             continue
         entries.append(LogEntry(path=p, fmt="json", mtime=st.st_mtime, size=st.st_size))
-    entries.sort(key=lambda e: e.mtime, reverse=True)
+    entries.sort(key=lambda e: (e.mtime, str(e.path)), reverse=True)
     return entries
 
 
 def _load_json_report(path: Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))  # type: ignore[no-any-return]
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(
             t("could not load report {path}: {exc}").format(path=path, exc=exc)
         ) from exc
@@ -77,12 +77,36 @@ def diff_reports(from_path: Path, to_path: Path) -> dict[str, Any]:
     for cat in categories:
         av = a.get(cat, {})
         bv = b.get(cat, {})
+        # Orphans is a list[str], not dict
+        if cat == "orphans":
+            av_list = av if isinstance(av, list) else []
+            bv_list = bv if isinstance(bv, list) else []
+            a_set_o = set(av_list)
+            b_set_o = set(bv_list)
+            added_o = sorted(b_set_o - a_set_o)
+            removed_o = sorted(a_set_o - b_set_o)
+            if added_o or removed_o:
+                result["diff"][cat] = {"added": added_o, "removed": removed_o}
+            continue
         # Handle dict vs list differences; normalize to dict of sets
-        # For broken_libs/undefined_symbols structure is nested
+        # For broken_libs/undefined_symbols structure is nested, normalize order before compare
         if cat in ("broken_libs", "undefined_symbols"):
-            # Compare stringified
-            a_str = json.dumps(av, sort_keys=True)
-            b_str = json.dumps(bv, sort_keys=True)
+            # Normalize lists order for deterministic compare
+            def _normalize(obj: Any) -> Any:
+                if isinstance(obj, dict):
+                    return {k: _normalize(v) for k, v in sorted(obj.items())}
+                if isinstance(obj, list):
+                    # For broken_libs, list of dicts: sort by binary name if possible
+                    try:
+                        return sorted(obj, key=lambda x: json.dumps(x, sort_keys=True))
+                    except Exception:
+                        return sorted(obj, key=str) if all(isinstance(x, str) for x in obj) else obj
+                return obj
+
+            av_n = _normalize(av)
+            bv_n = _normalize(bv)
+            a_str = json.dumps(av_n, sort_keys=True)
+            b_str = json.dumps(bv_n, sort_keys=True)
             if a_str != b_str:
                 result["diff"][cat] = {"from": av, "to": bv}
             continue
@@ -107,18 +131,18 @@ def diff_reports(from_path: Path, to_path: Path) -> dict[str, Any]:
         if added or removed:
             result["diff"][cat] = {"added": added, "removed": removed}
     # Summary
-    summary_diff = {}
+    summary_diff: dict[str, Any] = {}
     a_sum = a.get("summary", {})
     b_sum = b.get("summary", {})
     for key in set(a_sum.keys()) | set(b_sum.keys()):
         av = a_sum.get(key, 0)
         bv = b_sum.get(key, 0)
         if av != bv:
-            summary_diff[key] = {
-                "from": av,
-                "to": bv,
-                "delta": bv - av if isinstance(av, int) and isinstance(bv, int) else None,
-            }
+            try:
+                delta = bv - av if isinstance(av, int) and isinstance(bv, int) else None
+            except TypeError:
+                delta = None
+            summary_diff[key] = {"from": av, "to": bv, "delta": delta}
     if summary_diff:
         result["diff"]["summary"] = summary_diff
     return result

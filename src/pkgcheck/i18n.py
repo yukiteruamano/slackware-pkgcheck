@@ -22,7 +22,7 @@ ALL_LANGUAGES: Final = (DEFAULT_LANGUAGE, *SUPPORTED_LANGUAGES)
 _LOCALE_ENV_KEYS = ("LC_ALL", "LC_MESSAGES", "LANG")
 
 # Markers of Traditional Chinese (we have no zh-Hant translation): use the fallback.
-_TRADITIONAL_ZH_MARKERS = ("_TW", "_HK", "_MO", "_HANT")
+_TRADITIONAL_ZH_MARKERS = ("_TW", "_HK", "_MO", "_HANT", "-TW", "-HK", "-MO", "-HANT")
 
 _table: dict[str, str] = {}
 _current = DEFAULT_LANGUAGE
@@ -61,7 +61,9 @@ def _os_code() -> str | None:
     """Detects the OS locale code (e.g. ``es_ES``) from the environment."""
     for key in _LOCALE_ENV_KEYS:
         value = os.environ.get(key)
-        if value and value not in ("C", "POSIX"):
+        if value:
+            if value in ("C", "POSIX"):
+                return None
             return value.split(".", 1)[0]
     try:
         code, _ = locale.getlocale()

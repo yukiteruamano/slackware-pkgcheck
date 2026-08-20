@@ -1328,7 +1328,7 @@ class CliRootCoverageTest(unittest.TestCase):
                 pass
             mock_exec.assert_called_once()
             args = mock_exec.call_args[0][1]
-            self.assertIn("/usr/bin/pkgcheck", args[2] if len(args) > 2 else "")
+            self.assertTrue(any("/usr/bin/pkgcheck" in str(a) for a in args))
 
 
 class CliWriteLogCoverageTest(unittest.TestCase):

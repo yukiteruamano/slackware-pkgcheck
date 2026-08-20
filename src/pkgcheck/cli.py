@@ -331,10 +331,12 @@ def _resolve_log_path(value: str | None, log_dir: Path) -> Path | None:
             idx = int(value.split("-", 1)[1])
         except ValueError:
             return Path(value)
+        if idx < 1:
+            return None
         entries = list_logs(log_dir)
         if 1 <= idx <= len(entries):
             return entries[idx - 1].path
-        return Path(value)
+        return None
     return Path(value)
 
 
@@ -527,7 +529,11 @@ def _exec_with_sudo() -> None:
         cmd = [sys.executable, "-m", "pkgcheck", *sys.argv[1:]]
     else:
         cmd = [script, *sys.argv[1:]]
-    os.execvp(sudo_bin, [sudo_bin, "--", *cmd])
+    # Preserve UTF-8 fallback env across sudo (sudo env_reset may drop it)
+    os.execvp(
+        sudo_bin,
+        [sudo_bin, "--preserve-env=PYTHONIOENCODING,LC_ALL,LC_MESSAGES,LANG", "--", *cmd],
+    )
 
 
 def _pseudo_prefixes(args: argparse.Namespace) -> tuple[str, ...]:
@@ -575,6 +581,7 @@ def _write_auto_log(
     """
     if os.geteuid() != 0:
         return None
+    log_path: Path | None = None
     try:
         log_path = unique_report_path(_LOG_DIR, when, fmt)
         _LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -594,7 +601,7 @@ def _write_auto_log(
     except OSError as exc:
         console.print(
             t("[yellow]Could not write the log to {path}: {exc}[/yellow]").format(
-                path=log_path, exc=exc
+                path=log_path or _LOG_DIR, exc=exc
             )
         )
         return None
@@ -636,7 +643,7 @@ def _run(
         MofNCompleteColumn(),
         TimeElapsedColumn(),
     )
-    with Progress(*progress_columns, console=status, disable=args.quiet) as progress:
+    with Progress(*progress_columns, console=status, disable=args.quiet or args.json) as progress:
         verify_task = progress.add_task(t("Verifying existence of files..."), total=len(entries))
         if args.check_libs_deps:
             statuses, elf_flags = verify_paths_with_elf(
@@ -704,7 +711,9 @@ def _run(
             elf_paths = [f"/{rel}" for _, rel in elf_entries]
             owner_index = build_library_owner_index(entries)
 
-            with Progress(*progress_columns, console=status, disable=args.quiet) as progress:
+            with Progress(
+                *progress_columns, console=status, disable=args.quiet or args.json
+            ) as progress:
                 deps_task = progress.add_task(
                     t("Checking library dependencies (ldd)..."), total=len(elf_paths)
                 )
@@ -738,7 +747,9 @@ def _run(
 
             if args.check_libs_symbols:
                 assert readelf_bin is not None
-                with Progress(*progress_columns, console=status, disable=args.quiet) as progress:
+                with Progress(
+                    *progress_columns, console=status, disable=args.quiet or args.json
+                ) as progress:
                     sym_task = progress.add_task(
                         t("Collecting defined symbols..."), total=len(elf_paths)
                     )
@@ -748,7 +759,9 @@ def _run(
                         readelf_bin,
                         on_progress=lambda done: progress.update(sym_task, completed=done),
                     )
-                with Progress(*progress_columns, console=status, disable=args.quiet) as progress:
+                with Progress(
+                    *progress_columns, console=status, disable=args.quiet or args.json
+                ) as progress:
                     undef_task = progress.add_task(
                         t("Checking undefined symbols..."), total=len(elf_paths)
                     )
@@ -783,8 +796,21 @@ def _run(
     )
 
     if not args.quiet and not args.json:
-        if missing_by_package:
-            print_breakdown(console, dict(missing_by_package), args.max_rows, style="bold red")
+        has_issues = any(
+            [
+                missing_by_package,
+                backup_by_package,
+                pending_new_by_package,
+                errors_by_package,
+                no_access_by_package,
+                broken_libs,
+                undefined_symbols,
+                orphans,
+            ]
+        )
+        if has_issues:
+            if missing_by_package:
+                print_breakdown(console, dict(missing_by_package), args.max_rows, style="bold red")
         else:
             console.print(t("[green]All registered files exist on the system.[/green]"))
         if pending_new_by_package:
@@ -876,7 +902,7 @@ def _run(
         dict(pending_new_by_package),
         dict(errors_by_package),
     )
-    if args.json and os.geteuid() != 0:
+    if args.json:
         sys.stdout.write(
             json_report(
                 summary,
@@ -887,6 +913,19 @@ def _run(
                 orphans or None,
             )
         )
+        if os.geteuid() == 0:
+            log_path = _write_auto_log(
+                status,
+                when,
+                fmt,
+                summary,
+                *indexes,
+                broken_libs or None,
+                undefined_symbols or None,
+                orphans or None,
+            )
+            if log_path is not None:
+                status.print(t("[green]Log saved to:[/green] {path}").format(path=log_path))
         return
     log_path = _write_auto_log(
         status,

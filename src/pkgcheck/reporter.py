@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -49,10 +51,20 @@ def report_path(log_dir: Path, when: datetime, fmt: str) -> Path:
 def unique_report_path(log_dir: Path, when: datetime, fmt: str) -> Path:
     """Returns a log path that does not yet exist, appending a ``-N`` suffix on collision."""
     path = report_path(log_dir, when, fmt)
-    for index in range(1, 10_000):
+    # Fast path: no collision
+    try:
         if not path.exists():
             return path
-        path = log_dir / f"pkgcheck-{when:{_LOG_TIME_FORMAT}}-{index}.{fmt}"
+    except OSError:
+        # If we cannot stat, return original and let write_report handle error
+        return path
+    for index in range(1, 10_000):
+        candidate = log_dir / f"pkgcheck-{when:{_LOG_TIME_FORMAT}}-{index}.{fmt}"
+        try:
+            if not candidate.exists():
+                return candidate
+        except OSError:
+            return candidate
     raise OSError(t("too many pkgcheck logs in {dir} for the same second").format(dir=log_dir))
 
 
@@ -133,6 +145,13 @@ def _text_section(lines: list[str], header: str) -> None:
     lines.extend(["", "=" * 46, header, "=" * 46])
 
 
+def _escape_tsv(value: str) -> str:
+    """Escapes tabs and newlines for TSV log sections."""
+    return (
+        value.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+    )
+
+
 def _banner_heading(heading: str, style: str) -> str:
     """Wraps a breakdown heading so it stands out: color + asterisks."""
     stars = "*" * _BANNER_LEN
@@ -158,8 +177,12 @@ def print_breakdown(
             tree.add(t("... and {remaining} more packages").format(remaining=remaining))
             break
         branch = tree.add(f"[bold cyan]{package}[/bold cyan] ({len(paths)})")
-        for path in paths:
-            branch.add(path)
+        # Limit paths per package to avoid OOM (show first max_rows*10 or 1000)
+        limit = 1000
+        for p in paths[:limit]:
+            branch.add(p)
+        if len(paths) > limit:
+            branch.add(t("... and {remaining} more files").format(remaining=len(paths) - limit))
     console.print(tree)
     console.print()
 
@@ -211,35 +234,44 @@ def write_report(
 ) -> None:
     """Writes the report to `output`; the format depends on the extension (.json/.log)."""
     if output.suffix.lower() == ".json":
-        output.write_text(
-            json_report(
-                summary,
-                missing_by_package,
-                no_access_by_package,
-                backup_by_package,
-                pending_new_by_package,
-                errors_by_package,
-                when,
-                broken_libs,
-                undefined_symbols,
-                orphans,
-            )
+        content = json_report(
+            summary,
+            missing_by_package,
+            no_access_by_package,
+            backup_by_package,
+            pending_new_by_package,
+            errors_by_package,
+            when,
+            broken_libs,
+            undefined_symbols,
+            orphans,
         )
     else:
-        output.write_text(
-            _text_report(
-                summary,
-                missing_by_package,
-                no_access_by_package,
-                backup_by_package,
-                pending_new_by_package,
-                errors_by_package,
-                when,
-                broken_libs,
-                undefined_symbols,
-                orphans,
-            )
+        content = _text_report(
+            summary,
+            missing_by_package,
+            no_access_by_package,
+            backup_by_package,
+            pending_new_by_package,
+            errors_by_package,
+            when,
+            broken_libs,
+            undefined_symbols,
+            orphans,
         )
+    # Atomic write via temp file in same directory to avoid partial logs on crash
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=str(output.parent), prefix=".pkgcheck-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_path, output)
+    except OSError:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def json_report(
@@ -355,52 +387,64 @@ def _text_report(
     _text_section(lines, t("MISSING:"))
     if missing_by_package:
         for package, paths in sorted(missing_by_package.items()):
-            lines.extend(f"{package}\t{path}" for path in paths)
+            esc_pkg = _escape_tsv(package)
+            for path in paths:
+                lines.append(f"{esc_pkg}\t{_escape_tsv(path)}")
     else:
         lines.append(t("(none)"))
 
     if pending_new_by_package:
         _text_section(lines, t("NEW CONFIG PENDING (manual review):"))
         for package, paths in sorted(pending_new_by_package.items()):
-            lines.extend(f"{package}\t{path}" for path in paths)
+            esc_pkg = _escape_tsv(package)
+            for path in paths:
+                lines.append(f"{esc_pkg}\t{_escape_tsv(path)}")
 
     if backup_by_package:
         _text_section(lines, t("BACKUP ONLY (.bak/.orig):"))
         for package, paths in sorted(backup_by_package.items()):
-            lines.extend(f"{package}\t{path}" for path in paths)
+            esc_pkg = _escape_tsv(package)
+            for path in paths:
+                lines.append(f"{esc_pkg}\t{_escape_tsv(path)}")
 
     if no_access_by_package:
         _text_section(lines, t("NO ACCESS (requires root privileges):"))
         for package, paths in sorted(no_access_by_package.items()):
-            lines.extend(f"{package}\t{path}" for path in paths)
+            esc_pkg = _escape_tsv(package)
+            for path in paths:
+                lines.append(f"{esc_pkg}\t{_escape_tsv(path)}")
 
     if errors_by_package:
         _text_section(lines, t("ERRORS:"))
         for package, paths in sorted(errors_by_package.items()):
-            lines.extend(f"{package}\t{path}" for path in paths)
+            esc_pkg = _escape_tsv(package)
+            for path in paths:
+                lines.append(f"{esc_pkg}\t{_escape_tsv(path)}")
 
     if broken_libs:
         _text_section(lines, t("BROKEN LIBRARY DEPS:"))
         for package, items in sorted(broken_libs.items()):
-            lines.append(f"{package}")
+            lines.append(_escape_tsv(package))
             for item in items:
                 provided = " ".join(
-                    f"{lib}={owner or t('(unknown)')}" for lib, owner in item.provided_by.items()
+                    f"{_escape_tsv(lib)}={_escape_tsv(owner) if owner else t('(unknown)')}"
+                    for lib, owner in item.provided_by.items()
                 )
-                detail = ", ".join(item.missing)
+                detail = ", ".join(_escape_tsv(m) for m in item.missing)
                 if provided:
                     detail = f"{detail} [provided by: {provided}]"
-                lines.append(f"\t{item.binary}\t{detail}")
+                lines.append(f"\t{_escape_tsv(item.binary)}\t{_escape_tsv(detail)}")
 
     if undefined_symbols:
         _text_section(lines, t("UNDEFINED SYMBOLS (may be false positives):"))
         for package, binaries in sorted(undefined_symbols.items()):
+            esc_pkg = _escape_tsv(package)
             for binary, symbols in binaries.items():
-                lines.append(f"{package}\t{binary}\t{', '.join(symbols)}")
+                lines.append(f"{esc_pkg}\t{_escape_tsv(binary)}\t{_escape_tsv(', '.join(symbols))}")
 
     if orphans:
         _text_section(lines, t("ORPHANS (untracked files):"))
         for path in sorted(orphans):
-            lines.append(path)
+            lines.append(_escape_tsv(path))
 
     return "\n".join(lines) + "\n"

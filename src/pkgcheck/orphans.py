@@ -47,40 +47,38 @@ def find_orphans(
     """
     orphans: list[str] = []
     root_str = str(root)
-    # Normalize owned to ensure leading /
-    # Walk
-    for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
-        # Compute relative dir for exclusion check
+    owned_rels = {p.lstrip("/") for p in owned}
+    for dirpath, dirnames, filenames in os.walk(
+        root, topdown=True, followlinks=False, onerror=lambda _: None
+    ):
         try:
             rel_dir = os.path.relpath(dirpath, root_str)
         except ValueError:
             rel_dir = ""
         if rel_dir == ".":
             rel_dir = ""
+            # Prune top-level dirs that are pseudo
+            for d in list(dirnames):
+                if _is_orphan_excluded(f"{d}/", extra_exclude):
+                    dirnames.remove(d)
         else:
             rel_dir = rel_dir.rstrip("/") + "/"
             if _is_orphan_excluded(rel_dir, extra_exclude):
-                # Prune traversal
                 dirnames[:] = []
                 continue
-            # Also prune subdirs that are excluded
-            # Filter dirnames in-place to avoid descending
-            pruned = []
             for d in list(dirnames):
-                rel_sub = f"{rel_dir}{d}/" if rel_dir else f"{d}/"
+                rel_sub = f"{rel_dir}{d}/"
                 if _is_orphan_excluded(rel_sub, extra_exclude):
-                    pruned.append(d)
-            for d in pruned:
-                dirnames.remove(d)
-
+                    dirnames.remove(d)
         for fname in filenames:
             rel = f"{rel_dir}{fname}" if rel_dir else fname
             if _is_orphan_excluded(rel, extra_exclude):
                 continue
-            abs_path = f"/{rel}" if root_str == "/" else f"{root_str.rstrip('/')}/{rel}"
-            # Normalize // -> /
-            abs_path = abs_path.replace("//", "/")
-            if abs_path not in owned:
-                orphans.append(abs_path)
+            if rel in owned_rels:
+                continue
+            # Build display path (chroot-aware) and normalize
+            display_path = os.path.normpath(str(root / rel) if root_str != "/" else f"/{rel}")
+            if display_path not in orphans:
+                orphans.append(display_path)
     orphans.sort()
     return orphans
