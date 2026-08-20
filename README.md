@@ -39,7 +39,36 @@ sudo uv run pkgcheck --json                   # writes the log in JSON format (.
 uv run pkgcheck --no-elevate --json           # without root: only prints the JSON to stdout
 uv run pkgcheck --workers 16                  # adjusts the parallelism
 uv run pkgcheck --packages-dir /mnt/root/var/log/packages
+sudo uv run pkgcheck --check-libs-deps        # also checks library dependencies (ldd)
+sudo uv run pkgcheck --check-libs-deps --check-libs-symbols   # + undefined symbols
 ```
+
+### Library dependencies (`--check-libs-deps`)
+
+Inspired by Gentoo's `revdep-rebuild`, this optional check verifies that every
+installed ELF binary and shared library has **all** of its dynamic library
+dependencies present on the system. For each ELF file `ldd` is run (in parallel)
+and any `not found` dependency is flagged:
+
+- The **broken binary/library** and the **owning package** are reported.
+- A **best-effort** guess is made for which installed package should provide each
+  missing library (matched by library basename; it may be `None` when the soname
+  does not match any installed file).
+- Results are grouped by package in the `broken_libs` section of the JSON report
+  (`{package: [{binary, missing, provided_by}]}`) and in the text log under
+  `BROKEN LIBRARY DEPS:`.
+
+Requires `ldd` (present on Slackware/glibc). It is opt-in because running `ldd`
+over the whole system is expensive.
+
+### Undefined symbols (`--check-libs-symbols`)
+
+An optional, extra mode (mirrors revdep-rebuild's `-u` / `SEARCH_SYMBOLS`). After
+collecting the set of dynamic symbols exported by the installed libraries, it
+flags binaries that import symbols no installed library provides. It **requires**
+`--check-libs-deps` and the `readelf` tool, and is **prone to false positives**
+(lazy binding, `dlopen`-loaded libraries, symbol versioning). Results appear in
+the `undefined_symbols` JSON key and the `UNDEFINED SYMBOLS` log section.
 
 ### Root privileges
 
@@ -110,7 +139,8 @@ pkgcheck-dd-mm-yyyy-hh-mm-ss.json   # with --json
 
 The JSON document includes a `timestamp` (ISO 8601), `generator`, `version`, `summary`
 and the per-package indexes `missing`, `files_backup`, `files_pending_new`, `no_access`
-and `files_errors`. These keys are stable and never localized.
+and `files_errors`. With `--check-libs-deps` the `broken_libs` index is added, and with
+`--check-libs-symbols` also `undefined_symbols`. These keys are stable and never localized.
 
 ### Internationalization
 
@@ -142,6 +172,11 @@ are not localized: they are the stable API.
 | `--backup-suffixes`| Backup suffixes detected as backup-only (default `.bak,.orig`).          |
 | `--new-suffix`     | New-config suffix pending review (default `.new`).                       |
 | `--lang LANG`      | Interface language (`en,es,pt,fr,de,zh,ja`); detects the OS language.    |
+| `--check-libs-deps`| Also checks that every installed ELF binary/library has all its dynamic  |
+|                    | library dependencies present (`ldd`; revdep-rebuild style).               |
+| `--check-libs-symbols`| Also checks installed binaries for undefined dynamic symbols not        |
+|                    | provided by any installed library (requires `--check-libs-deps`; may      |
+|                    | report false positives).                                                  |
 | `--quiet`          | Hides progress and breakdown; only prints the summary.                   |
 | `--elevate`        | Re-runs with sudo if root privileges are not available.                  |
 | `--no-elevate`     | Does not ask for root privileges; only verifies what is accessible.      |

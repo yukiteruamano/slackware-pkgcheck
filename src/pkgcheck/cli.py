@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import shutil
 import sys
@@ -24,15 +25,26 @@ from rich.prompt import Confirm
 
 from pkgcheck import __version__
 from pkgcheck.i18n import ALL_LANGUAGES, detect_language, is_supported, set_language, t
+from pkgcheck.libdeps import (
+    build_library_owner_index,
+    check_library_deps,
+    check_undefined_symbols,
+    collect_defined_symbols,
+    find_missing_owner,
+)
 from pkgcheck.reporter import (
     BackupIndex,
+    BrokenBinary,
+    BrokenLibsIndex,
     ErrorsIndex,
     MissingIndex,
     NoAccessIndex,
     PendingNewIndex,
     Summary,
+    UndefinedSymbolsIndex,
     json_report,
     print_breakdown,
+    print_broken_libs,
     print_summary,
     unique_report_path,
     write_report,
@@ -43,6 +55,7 @@ from pkgcheck.verifier import (
     _DEFAULT_NEW_SUFFIX,
     PathStatus,
     verify_paths,
+    verify_paths_with_elf,
 )
 
 _DEFAULT_PACKAGES_DIR = "/var/log/packages"
@@ -54,6 +67,38 @@ _MAX_WORKERS = 512
 
 def _default_workers() -> int:
     return min(32, (os.cpu_count() or 1) + 4)
+
+
+def _is_utf8(encoding: str | None) -> bool:
+    """Returns whether `encoding` is a UTF-8 codec name (case/separator-insensitive)."""
+    if not encoding:
+        return False
+    return encoding.lower().replace("_", "").replace("-", "") == "utf8"
+
+
+def _ensure_utf8_environment() -> str | None:
+    """Detects a broken (non-UTF-8) terminal encoding and forces the UTF-8 fallback.
+
+    Called before any output so pkgcheck never crashes writing to the console
+    (e.g. the rich spinner uses Braille characters that latin-1 cannot encode).
+
+    Reconfigures stdout/stderr to UTF-8 and, when something was broken, applies the
+    documented fallback ``LANG=en_US`` / ``UTF-8`` (also inherited by subprocesses
+    and by the ``sudo`` re-exec). Returns the previous encoding so the caller can
+    warn the user, or ``None`` when the environment was already correct.
+    """
+    previous: str | None = None
+    for stream in (sys.stdout, sys.stderr):
+        encoding = getattr(stream, "encoding", None)
+        if encoding is not None and not _is_utf8(encoding):
+            previous = previous or encoding
+            with contextlib.suppress(AttributeError, ValueError, OSError):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+    if previous is not None:
+        os.environ["PYTHONIOENCODING"] = "utf-8"
+        os.environ["LC_ALL"] = "en_US.UTF-8"
+        os.environ["LANG"] = "en_US.UTF-8"
+    return previous
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -118,6 +163,23 @@ def _build_parser() -> argparse.ArgumentParser:
         ).format(suffix=_DEFAULT_NEW_SUFFIX),
     )
     parser.add_argument(
+        "--check-libs-deps",
+        action="store_true",
+        help=t(
+            "Also checks that every installed ELF binary and shared library has all "
+            "its dynamic library dependencies present (revdep-rebuild style)."
+        ),
+    )
+    parser.add_argument(
+        "--check-libs-symbols",
+        action="store_true",
+        help=t(
+            "Also checks installed binaries for undefined dynamic symbols not provided "
+            "by any installed library (requires --check-libs-deps; may report false "
+            "positives)."
+        ),
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help=t("Hides progress and breakdown; only prints the summary."),
@@ -151,6 +213,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     """Main entry point: validates the environment and starts the analysis."""
+    previous_encoding = _ensure_utf8_environment()
+
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--lang")
     known, _ = pre_parser.parse_known_args()
@@ -185,6 +249,15 @@ def main() -> None:
 
     console = Console()
     status_console = Console(stderr=True)
+
+    if previous_encoding is not None:
+        (status_console if args.json else console).print(
+            t(
+                "[yellow]Warning: terminal encoding is not UTF-8 (detected: {encoding}). "
+                "Using fallback LANG=en_US/UTF-8 to avoid output errors.[/yellow]"
+            ).format(encoding=previous_encoding)
+        )
+
     _ensure_root(args, console, status_console)
 
     rg_bin = shutil.which("rg")
@@ -193,8 +266,21 @@ def main() -> None:
             t("ripgrep (rg) was not found on the system; install it before using pkgcheck")
         )
 
+    if args.check_libs_symbols and not args.check_libs_deps:
+        parser.error(t("--check-libs-symbols requires --check-libs-deps"))
+
+    ldd_bin = shutil.which("ldd") if args.check_libs_deps else None
+    if args.check_libs_deps and ldd_bin is None:
+        parser.error(t("ldd was not found on the system; it is required for --check-libs-deps"))
+
+    readelf_bin = shutil.which("readelf") if args.check_libs_symbols else None
+    if args.check_libs_symbols and readelf_bin is None:
+        parser.error(
+            t("readelf was not found on the system; it is required for --check-libs-symbols")
+        )
+
     try:
-        _run(console, status_console, args, packages_dir, rg_bin)
+        _run(console, status_console, args, packages_dir, rg_bin, ldd_bin, readelf_bin)
     except KeyboardInterrupt:
         console.print(t("\n[red]Interrupted by the user.[/red]"))
         raise SystemExit(130) from None
@@ -282,6 +368,8 @@ def _write_auto_log(
     backup_by_package: BackupIndex,
     pending_new_by_package: PendingNewIndex,
     errors_by_package: ErrorsIndex,
+    broken_libs: BrokenLibsIndex | None = None,
+    undefined_symbols: UndefinedSymbolsIndex | None = None,
 ) -> Path | None:
     """Writes the automatic log to ``/var/log/pkgcheck``; requires root.
 
@@ -301,6 +389,8 @@ def _write_auto_log(
             pending_new_by_package,
             errors_by_package,
             when,
+            broken_libs,
+            undefined_symbols,
         )
     except OSError as exc:
         console.print(
@@ -318,6 +408,8 @@ def _run(
     args: argparse.Namespace,
     packages_dir: Path,
     rg_bin: str,
+    ldd_bin: str | None,
+    readelf_bin: str | None,
 ) -> None:
     started = time.monotonic()
     when = datetime.now()
@@ -347,13 +439,23 @@ def _run(
     )
     with Progress(*progress_columns, console=status, disable=args.quiet) as progress:
         verify_task = progress.add_task(t("Verifying existence of files..."), total=len(entries))
-        statuses = verify_paths(
-            abs_paths,
-            args.workers,
-            on_progress=lambda done: progress.update(verify_task, completed=done),
-            backup_suffixes=_backup_suffixes(args),
-            new_suffix=_new_suffix(args),
-        )
+        if args.check_libs_deps:
+            statuses, elf_flags = verify_paths_with_elf(
+                abs_paths,
+                args.workers,
+                on_progress=lambda done: progress.update(verify_task, completed=done),
+                backup_suffixes=_backup_suffixes(args),
+                new_suffix=_new_suffix(args),
+            )
+        else:
+            statuses = verify_paths(
+                abs_paths,
+                args.workers,
+                on_progress=lambda done: progress.update(verify_task, completed=done),
+                backup_suffixes=_backup_suffixes(args),
+                new_suffix=_new_suffix(args),
+            )
+            elf_flags = None
 
     missing_by_package: MissingIndex = defaultdict(list)
     no_access_by_package: NoAccessIndex = defaultdict(list)
@@ -374,6 +476,72 @@ def _run(
         elif st is PathStatus.ERROR:
             errors_by_package[package].append(f"/{rel}")
 
+    broken_libs: BrokenLibsIndex = {}
+    undefined_symbols: UndefinedSymbolsIndex = {}
+    broken_count = 0
+    missing_lib_count = 0
+    undefined_count = 0
+    if args.check_libs_deps:
+        assert ldd_bin is not None and elf_flags is not None
+        elf_entries = [
+            (package, rel)
+            for (package, rel), is_elf in zip(entries, elf_flags, strict=True)
+            if is_elf
+        ]
+        if elf_entries:
+            elf_paths = [f"/{rel}" for _, rel in elf_entries]
+            owner_index = build_library_owner_index(entries)
+
+            with Progress(*progress_columns, console=status, disable=args.quiet) as progress:
+                deps_task = progress.add_task(
+                    t("Checking library dependencies (ldd)..."), total=len(elf_paths)
+                )
+                missing_per_path = check_library_deps(
+                    elf_paths,
+                    args.workers,
+                    ldd_bin,
+                    on_progress=lambda done: progress.update(deps_task, completed=done),
+                )
+
+            for (package, rel), missing in zip(elf_entries, missing_per_path, strict=True):
+                if not missing:
+                    continue
+                provided_by = find_missing_owner(missing, owner_index)
+                broken_libs.setdefault(package, []).append(
+                    BrokenBinary(binary=f"/{rel}", missing=missing, provided_by=provided_by)
+                )
+                broken_count += 1
+                missing_lib_count += len(missing)
+
+            if args.check_libs_symbols:
+                assert readelf_bin is not None
+                with Progress(*progress_columns, console=status, disable=args.quiet) as progress:
+                    sym_task = progress.add_task(
+                        t("Collecting defined symbols..."), total=len(elf_paths)
+                    )
+                    defined = collect_defined_symbols(
+                        elf_paths,
+                        args.workers,
+                        readelf_bin,
+                        on_progress=lambda done: progress.update(sym_task, completed=done),
+                    )
+                with Progress(*progress_columns, console=status, disable=args.quiet) as progress:
+                    undef_task = progress.add_task(
+                        t("Checking undefined symbols..."), total=len(elf_paths)
+                    )
+                    undefined_by_path = check_undefined_symbols(
+                        elf_paths,
+                        defined,
+                        args.workers,
+                        readelf_bin,
+                        on_progress=lambda done: progress.update(undef_task, completed=done),
+                    )
+                for (package, rel), symbols in zip(elf_entries, undefined_by_path, strict=True):
+                    if not symbols:
+                        continue
+                    undefined_symbols.setdefault(package, {})[f"/{rel}"] = symbols
+                    undefined_count += 1
+
     elapsed = time.monotonic() - started
     summary = Summary(
         packages=len(packages),
@@ -385,11 +553,14 @@ def _run(
         errors=counts[PathStatus.ERROR],
         excluded_install=scan_result.excluded_install,
         excluded_pseudo=scan_result.excluded_pseudo,
+        broken_binaries=broken_count,
+        missing_libs=missing_lib_count,
+        undefined_symbol_binaries=undefined_count,
     )
 
     if not args.quiet and not args.json:
         if missing_by_package:
-            print_breakdown(console, dict(missing_by_package), args.max_rows)
+            print_breakdown(console, dict(missing_by_package), args.max_rows, style="bold red")
         else:
             console.print(t("[green]All registered files exist on the system.[/green]"))
         if pending_new_by_package:
@@ -398,6 +569,7 @@ def _run(
                 dict(pending_new_by_package),
                 args.max_rows,
                 title=t("Configs .new pending review by package"),
+                style="bold yellow",
             )
         if errors_by_package:
             print_breakdown(
@@ -405,6 +577,23 @@ def _run(
                 dict(errors_by_package),
                 args.max_rows,
                 title=t("Files with verification errors by package"),
+                style="bold red",
+            )
+        if broken_libs:
+            print_broken_libs(console, broken_libs, args.max_rows, style="bold red")
+        if undefined_symbols:
+            print_broken_libs(
+                console,
+                {
+                    package: [
+                        BrokenBinary(binary=binary, missing=symbols, provided_by={})
+                        for binary, symbols in binaries.items()
+                    ]
+                    for package, binaries in undefined_symbols.items()
+                },
+                args.max_rows,
+                title=t("Binaries with undefined symbols by package"),
+                style="bold yellow",
             )
 
     if not args.json:
@@ -443,8 +632,12 @@ def _run(
         dict(errors_by_package),
     )
     if args.json and os.geteuid() != 0:
-        sys.stdout.write(json_report(summary, *indexes, when))
+        sys.stdout.write(
+            json_report(summary, *indexes, when, broken_libs or None, undefined_symbols or None)
+        )
         return
-    log_path = _write_auto_log(status, when, fmt, summary, *indexes)
+    log_path = _write_auto_log(
+        status, when, fmt, summary, *indexes, broken_libs or None, undefined_symbols or None
+    )
     if log_path is not None:
         status.print(t("[green]Log saved to:[/green] {path}").format(path=log_path))

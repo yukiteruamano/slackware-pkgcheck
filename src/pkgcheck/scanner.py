@@ -21,9 +21,10 @@ type PackageFile = tuple[str, str]
 _OCTAL_ESCAPE = re.compile(rb"\\[0-7]{3}")
 
 # Captures the FILE LIST: section from the marker to the end of the file. The '\n?'
-# tolerates a final line without a trailing newline; lines that no longer belong to the
-# section (headers such as 'REQUIRES:') are discarded in Python.
-_SCAN_PATTERN = r"^FILE LIST:\n(?:[^\n]*\n?)+"
+# tolerates a final line without a trailing newline; '\r?' tolerates CRLF records
+# (third-party/edited files); lines that no longer belong to the section (headers
+# such as 'REQUIRES:') are discarded in Python.
+_SCAN_PATTERN = r"^FILE LIST:\r?\n(?:[^\n]*\n?)+"
 
 _FILE_LIST_MARKER = "FILE LIST:"
 
@@ -51,6 +52,7 @@ class ScanResult:
     excluded_pseudo: int
 
 
+# RG flags for control
 _RG_FLAGS = (
     "--multiline",
     "--with-filename",
@@ -66,18 +68,29 @@ _RG_FLAGS = (
 
 
 def build_rg_command(rg_bin: str, packages_dir: Path) -> list[str]:
-    """Builds the ripgrep command that extracts all ``FILE LIST:`` sections."""
-    return [rg_bin, *_RG_FLAGS, _SCAN_PATTERN, str(packages_dir)]
+    """Builds the ripgrep command that extracts all ``FILE LIST:`` sections.
+
+    ``--`` stops option parsing so a directory whose name starts with ``-`` is never
+    interpreted as a flag.
+    """
+    return [rg_bin, *_RG_FLAGS, _SCAN_PATTERN, "--", str(packages_dir)]
+
+
+def _octal_to_byte(match: re.Match[bytes]) -> bytes:
+    """Decodes a ``\\NNN`` octal escape into a single byte, tolerating malformed values.
+
+    Slackware only encodes bytes 0-255, but a third-party record could contain an
+    escape above ``\\377``; such a value is clamped to ``0xFF`` instead of crashing.
+    """
+    value = int(match.group()[1:], 8)
+    return bytes([value if value <= 255 else 0xFF])
 
 
 def _unescape_path(rel: str) -> str:
     """Decodes the ``\\NNN`` octal escapes Slackware uses for non-ASCII bytes."""
     if "\\" not in rel:
         return rel
-    decoded = _OCTAL_ESCAPE.sub(
-        lambda match: bytes([int(match.group()[1:], 8)]),
-        rel.encode(),
-    )
+    decoded = _OCTAL_ESCAPE.sub(_octal_to_byte, rel.encode())
     return decoded.decode("utf-8", "replace")
 
 
@@ -138,7 +151,7 @@ def scan_package_files(
         if not line:
             continue
         package_path, _, rel_path = line.partition(":")
-        by_package.setdefault(Path(package_path).name, []).append(rel_path)
+        by_package.setdefault(Path(package_path).name, []).append(rel_path.rstrip("\r"))
 
     entries: list[PackageFile] = []
     excluded_install = 0

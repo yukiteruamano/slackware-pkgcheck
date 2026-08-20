@@ -20,7 +20,24 @@ type BackupIndex = dict[str, list[str]]
 type PendingNewIndex = dict[str, list[str]]
 type ErrorsIndex = dict[str, list[str]]
 
+
+# A single broken binary: its missing shared libraries and (best-effort) which
+# installed package should provide each one.
+@dataclass(frozen=True, slots=True)
+class BrokenBinary:
+    """A binary/library with at least one missing shared library dependency."""
+
+    binary: str
+    missing: list[str]
+    provided_by: dict[str, str | None]
+
+
+type BrokenLibsIndex = dict[str, list[BrokenBinary]]
+type UndefinedSymbolsIndex = dict[str, dict[str, list[str]]]
+
 _LOG_TIME_FORMAT = "%d-%m-%Y-%H-%M-%S"
+
+_BANNER_LEN = 12
 
 
 def report_path(log_dir: Path, when: datetime, fmt: str) -> Path:
@@ -51,6 +68,9 @@ class Summary:
     errors: int
     excluded_install: int
     excluded_pseudo: int
+    broken_binaries: int = 0
+    missing_libs: int = 0
+    undefined_symbol_binaries: int = 0
 
 
 def print_summary(console: Console, summary: Summary, elapsed: float) -> None:
@@ -80,10 +100,36 @@ def print_summary(console: Console, summary: Summary, elapsed: float) -> None:
         table.add_row(t("Install scripts excluded"), f"{summary.excluded_install:,}")
     if summary.excluded_pseudo:
         table.add_row(t("Pseudo-filesystems excluded"), f"{summary.excluded_pseudo:,}")
+    if summary.broken_binaries:
+        table.add_row(
+            t("Binaries with missing library deps"),
+            f"[red]{summary.broken_binaries:,}[/red]",
+        )
+    if summary.missing_libs:
+        table.add_row(
+            t("Missing shared libraries"),
+            f"[red]{summary.missing_libs:,}[/red]",
+        )
+    if summary.undefined_symbol_binaries:
+        table.add_row(
+            t("Binaries with undefined symbols"),
+            f"[yellow]{summary.undefined_symbol_binaries:,}[/yellow]",
+        )
     table.add_row(t("Total time"), f"{elapsed:.2f}s")
 
     console.print()
     console.print(table)
+
+
+def _text_section(lines: list[str], header: str) -> None:
+    """Adds a prominent section banner (====) around `header` in the text log."""
+    lines.extend(["", "=" * 46, header, "=" * 46])
+
+
+def _banner_heading(heading: str, style: str) -> str:
+    """Wraps a breakdown heading so it stands out: color + asterisks."""
+    stars = "*" * _BANNER_LEN
+    return f"[{style}]{stars} {heading} {stars}[/{style}]"
 
 
 def print_breakdown(
@@ -91,11 +137,14 @@ def print_breakdown(
     missing_by_package: MissingIndex,
     max_rows: int | None = None,
     title: str | None = None,
+    style: str = "bold yellow",
 ) -> None:
     """Prints the breakdown of files grouped by package."""
     if max_rows is not None and max_rows < 1:
         return
-    tree = Tree(title or t("Missing files by package"))
+    heading = title or t("Missing files by package")
+    console.print()
+    tree = Tree(_banner_heading(heading, style))
     for index, (package, paths) in enumerate(sorted(missing_by_package.items())):
         if max_rows is not None and index >= max_rows:
             remaining = len(missing_by_package) - index
@@ -105,6 +154,39 @@ def print_breakdown(
         for path in paths:
             branch.add(path)
     console.print(tree)
+    console.print()
+
+
+def print_broken_libs(
+    console: Console,
+    broken_libs: BrokenLibsIndex,
+    max_rows: int | None = None,
+    title: str | None = None,
+    style: str = "bold yellow",
+) -> None:
+    """Prints the breakdown of binaries with missing library deps grouped by package."""
+    if max_rows is not None and max_rows < 1:
+        return
+    heading = title or t("Binaries with missing library deps by package")
+    console.print()
+    tree = Tree(_banner_heading(heading, style))
+    for index, (package, items) in enumerate(sorted(broken_libs.items())):
+        if max_rows is not None and index >= max_rows:
+            remaining = len(broken_libs) - index
+            tree.add(t("... and {remaining} more packages").format(remaining=remaining))
+            break
+        branch = tree.add(f"[bold cyan]{package}[/bold cyan] ({len(items)})")
+        for item in items:
+            deps = ", ".join(item.missing)
+            provided = ", ".join(
+                f"{lib}={owner or t('(unknown)')}" for lib, owner in item.provided_by.items()
+            )
+            label = f"{item.binary} -> {deps}"
+            if provided:
+                label = f"{label} [{provided}]"
+            branch.add(label)
+    console.print(tree)
+    console.print()
 
 
 def write_report(
@@ -116,6 +198,8 @@ def write_report(
     pending_new_by_package: PendingNewIndex,
     errors_by_package: ErrorsIndex,
     when: datetime | None = None,
+    broken_libs: BrokenLibsIndex | None = None,
+    undefined_symbols: UndefinedSymbolsIndex | None = None,
 ) -> None:
     """Writes the report to `output`; the format depends on the extension (.json/.log)."""
     if output.suffix.lower() == ".json":
@@ -128,6 +212,8 @@ def write_report(
                 pending_new_by_package,
                 errors_by_package,
                 when,
+                broken_libs,
+                undefined_symbols,
             )
         )
     else:
@@ -140,6 +226,8 @@ def write_report(
                 pending_new_by_package,
                 errors_by_package,
                 when,
+                broken_libs,
+                undefined_symbols,
             )
         )
 
@@ -152,6 +240,8 @@ def json_report(
     pending_new_by_package: PendingNewIndex,
     errors_by_package: ErrorsIndex,
     when: datetime | None = None,
+    broken_libs: BrokenLibsIndex | None = None,
+    undefined_symbols: UndefinedSymbolsIndex | None = None,
 ) -> str:
     """Returns the full report as a JSON document."""
     data = {
@@ -164,6 +254,20 @@ def json_report(
         "no_access": no_access_by_package,
         "files_errors": errors_by_package,
     }
+    if broken_libs:
+        data["broken_libs"] = {
+            package: [
+                {
+                    "binary": item.binary,
+                    "missing": item.missing,
+                    "provided_by": item.provided_by,
+                }
+                for item in items
+            ]
+            for package, items in broken_libs.items()
+        }
+    if undefined_symbols:
+        data["undefined_symbols"] = undefined_symbols
     if when is not None:
         data["timestamp"] = when.isoformat()
     return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
@@ -177,6 +281,8 @@ def _text_report(
     pending_new_by_package: PendingNewIndex,
     errors_by_package: ErrorsIndex,
     when: datetime | None = None,
+    broken_libs: BrokenLibsIndex | None = None,
+    undefined_symbols: UndefinedSymbolsIndex | None = None,
 ) -> str:
     header = t("pkgcheck v{version} — Missing files by package").format(version=__version__)
     if when is not None:
@@ -208,13 +314,29 @@ def _text_report(
         summary_lines.append(
             t("Pseudo-filesystems excluded: {count}").format(count=f"{summary.excluded_pseudo:,}")
         )
+    if summary.broken_binaries:
+        summary_lines.append(
+            t("Binaries with missing library deps: {count}").format(
+                count=f"{summary.broken_binaries:,}"
+            )
+        )
+    if summary.missing_libs:
+        summary_lines.append(
+            t("Missing shared libraries: {count}").format(count=f"{summary.missing_libs:,}")
+        )
+    if summary.undefined_symbol_binaries:
+        summary_lines.append(
+            t("Binaries with undefined symbols: {count}").format(
+                count=f"{summary.undefined_symbol_binaries:,}"
+            )
+        )
     lines = [
         header,
         "=" * 46,
         *summary_lines,
         "",
-        t("MISSING:"),
     ]
+    _text_section(lines, t("MISSING:"))
     if missing_by_package:
         for package, paths in sorted(missing_by_package.items()):
             lines.extend(f"{package}\t{path}" for path in paths)
@@ -222,23 +344,42 @@ def _text_report(
         lines.append(t("(none)"))
 
     if pending_new_by_package:
-        lines.extend(["", t("NEW CONFIG PENDING (manual review):")])
+        _text_section(lines, t("NEW CONFIG PENDING (manual review):"))
         for package, paths in sorted(pending_new_by_package.items()):
             lines.extend(f"{package}\t{path}" for path in paths)
 
     if backup_by_package:
-        lines.extend(["", t("BACKUP ONLY (.bak/.orig):")])
+        _text_section(lines, t("BACKUP ONLY (.bak/.orig):"))
         for package, paths in sorted(backup_by_package.items()):
             lines.extend(f"{package}\t{path}" for path in paths)
 
     if no_access_by_package:
-        lines.extend(["", t("NO ACCESS (requires root privileges):")])
+        _text_section(lines, t("NO ACCESS (requires root privileges):"))
         for package, paths in sorted(no_access_by_package.items()):
             lines.extend(f"{package}\t{path}" for path in paths)
 
     if errors_by_package:
-        lines.extend(["", t("ERRORS:")])
+        _text_section(lines, t("ERRORS:"))
         for package, paths in sorted(errors_by_package.items()):
             lines.extend(f"{package}\t{path}" for path in paths)
+
+    if broken_libs:
+        _text_section(lines, t("BROKEN LIBRARY DEPS:"))
+        for package, items in sorted(broken_libs.items()):
+            lines.append(f"{package}")
+            for item in items:
+                provided = " ".join(
+                    f"{lib}={owner or t('(unknown)')}" for lib, owner in item.provided_by.items()
+                )
+                detail = ", ".join(item.missing)
+                if provided:
+                    detail = f"{detail} [provided by: {provided}]"
+                lines.append(f"\t{item.binary}\t{detail}")
+
+    if undefined_symbols:
+        _text_section(lines, t("UNDEFINED SYMBOLS (may be false positives):"))
+        for package, binaries in sorted(undefined_symbols.items()):
+            for binary, symbols in binaries.items():
+                lines.append(f"{package}\t{binary}\t{', '.join(symbols)}")
 
     return "\n".join(lines) + "\n"

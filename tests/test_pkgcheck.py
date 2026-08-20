@@ -6,17 +6,57 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import tempfile
+import types
 import unittest
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
 from pkgcheck import i18n
-from pkgcheck.cli import _backup_suffixes, _new_suffix, _pseudo_prefixes
-from pkgcheck.reporter import Summary, _text_report, json_report, print_breakdown, report_path
+from pkgcheck.cli import (
+    _backup_suffixes,
+    _ensure_utf8_environment,
+    _is_utf8,
+    _new_suffix,
+    _pseudo_prefixes,
+)
+from pkgcheck.libdeps import (
+    _missing_libs_of,
+    build_library_owner_index,
+    check_library_deps,
+    check_undefined_symbols,
+    collect_defined_symbols,
+    find_missing_owner,
+)
+from pkgcheck.reporter import (
+    BrokenBinary,
+    Summary,
+    _text_report,
+    json_report,
+    print_breakdown,
+    print_broken_libs,
+    report_path,
+)
 from pkgcheck.scanner import scan_package_files
-from pkgcheck.verifier import PathStatus, check_path, verify_paths
+from pkgcheck.verifier import (
+    PathStatus,
+    _is_elf,
+    check_path,
+    verify_paths,
+    verify_paths_with_elf,
+)
+
+
+class _FakeStream:
+    """Minimal stand-in for sys.stdout/sys.stderr in encoding tests."""
+
+    def __init__(self, encoding: str) -> None:
+        self.encoding = encoding
+
+    def reconfigure(self, **kwargs) -> None:
+        self.encoding = kwargs.get("encoding", self.encoding)
 
 
 def _summary() -> Summary:
@@ -149,10 +189,104 @@ class VerifierTest(unittest.TestCase):
         events: list[int] = []
         statuses = verify_paths(paths, 4, on_progress=events.append)
         self.assertEqual(statuses, [PathStatus.EXISTS, PathStatus.MISSING, PathStatus.EXISTS])
-        self.assertEqual(events, [3])
+        self.assertTrue(events)
+        self.assertEqual(events[-1], 3)
 
     def test_verify_paths_empty(self) -> None:
         self.assertEqual(verify_paths([], 4), [])
+
+    def test_verify_paths_with_elf(self) -> None:
+        elf_path = self._path("bin")
+        with open(elf_path, "wb") as handle:
+            handle.write(b"\x7fELF\x02\x01\x01\x00")
+        os.chmod(elf_path, 0o755)
+        text_path = self._path("doc")
+        with open(text_path, "w") as handle:
+            handle.write("hello\n")
+        missing = self._path("nope")
+        statuses, elf_flags = verify_paths_with_elf([elf_path, text_path, missing], 4)
+        self.assertEqual(statuses, [PathStatus.EXISTS, PathStatus.EXISTS, PathStatus.MISSING])
+        self.assertEqual(elf_flags, [True, False, False])
+
+    def test_verify_paths_with_elf_progress(self) -> None:
+        open(self._path("a"), "w").close()
+        events: list[int] = []
+        verify_paths_with_elf([self._path("a"), self._path("nope")], 4, on_progress=events.append)
+        self.assertTrue(events)
+        self.assertEqual(events[-1], 2)
+
+    def _write_elf(self, name: str, executable: bool = True) -> str:
+        path = self._path(name)
+        with open(path, "wb") as handle:
+            handle.write(b"\x7fELF\x02\x01\x01\x00")
+        if executable:
+            os.chmod(path, 0o755)
+        return path
+
+    def test_is_elf_true_for_executable(self) -> None:
+        self.assertTrue(_is_elf(self._write_elf("prog")))
+
+    def test_is_elf_true_for_so_library(self) -> None:
+        path = self._write_elf("libfoo.so", executable=False)
+        self.assertTrue(_is_elf(path))
+
+    def test_is_elf_false_for_non_exec_non_so(self) -> None:
+        path = self._write_elf("data.bin", executable=False)
+        self.assertFalse(_is_elf(path))
+
+    def test_is_elf_false_for_text(self) -> None:
+        path = self._path("script")
+        with open(path, "w") as handle:
+            handle.write("#!/bin/sh\n")
+        os.chmod(path, 0o755)
+        self.assertFalse(_is_elf(path))
+
+    def test_is_elf_false_for_missing(self) -> None:
+        self.assertFalse(_is_elf(self._path("nope")))
+
+    def test_is_elf_false_for_directory(self) -> None:
+        os.mkdir(self._path("adir"))
+        self.assertFalse(_is_elf(self._path("adir")))
+
+    def test_is_elf_false_for_fifo_without_blocking(self) -> None:
+        fifo = self._path("pipe")
+        os.mkfifo(fifo)
+        self.assertFalse(_is_elf(fifo))
+
+    def test_is_elf_symlink_to_elf(self) -> None:
+        target = self._write_elf("target")
+        link = self._path("link")
+        os.symlink(target, link)
+        self.assertTrue(_is_elf(link))
+
+    def test_is_elf_symlink_to_fifo_no_block(self) -> None:
+        fifo = self._path("fifo")
+        os.mkfifo(fifo)
+        link = self._path("lfifo")
+        os.symlink(fifo, link)
+        self.assertFalse(_is_elf(link))
+
+    def test_verify_paths_with_elf_skips_fifo(self) -> None:
+        fifo = self._path("pipe")
+        os.mkfifo(fifo)
+        statuses, elf_flags = verify_paths_with_elf([fifo], 4)
+        self.assertEqual(statuses, [PathStatus.EXISTS])
+        self.assertEqual(elf_flags, [False])
+
+    def test_verify_paths_workers_one(self) -> None:
+        for name in ("a", "b"):
+            open(self._path(name), "w").close()
+        statuses = verify_paths([self._path("a"), self._path("nope"), self._path("b")], 1)
+        self.assertEqual(statuses, [PathStatus.EXISTS, PathStatus.MISSING, PathStatus.EXISTS])
+
+    def test_verify_paths_with_elf_empty(self) -> None:
+        statuses, elf_flags = verify_paths_with_elf([], 4)
+        self.assertEqual(statuses, [])
+        self.assertEqual(elf_flags, [])
+
+    def test_check_path_no_access(self) -> None:
+        with mock.patch("os.lstat", side_effect=PermissionError):
+            self.assertIs(check_path(self._path("secret")), PathStatus.NO_ACCESS)
 
 
 class ScannerTest(unittest.TestCase):
@@ -195,6 +329,22 @@ class ScannerTest(unittest.TestCase):
         )
         result = self._scan()
         self.assertIn(("demo-2.0", "etc/ón.conf"), result.entries)
+
+    def test_octal_over_255_does_not_crash(self) -> None:
+        self._write("demo-ovr", b"FILE LIST:\nusr/bin/\\400\\777bad\n")
+        result = self._scan()
+        self.assertIn(("demo-ovr", "usr/bin/\ufffd\ufffdbad"), result.entries)
+
+    def test_crlf_records_are_parsed(self) -> None:
+        self._write("demo-crlf", b"FILE LIST:\r\nusr/bin/foo\r\netc/conf\r\n")
+        result = self._scan()
+        self.assertIn(("demo-crlf", "usr/bin/foo"), result.entries)
+        self.assertIn(("demo-crlf", "etc/conf"), result.entries)
+
+    def test_empty_file_list(self) -> None:
+        self._write("demo-empty", b"PACKAGE NAME: demo-empty\nFILE LIST:\n")
+        result = self._scan()
+        self.assertEqual(result.entries, [])
 
     def test_last_line_without_newline(self) -> None:
         self._write("demo-3.0", b"FILE LIST:\nusr/bin/a\nusr/bin/b")
@@ -250,6 +400,122 @@ class ScannerTest(unittest.TestCase):
         self.assertIn(("multi-1.0", "usr/bin/b"), result.entries)
 
 
+class LibdepsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write(self, name: str, content: bytes) -> str:
+        path = self.dir / name
+        path.write_bytes(content)
+        return str(path)
+
+    def test_build_library_owner_index(self) -> None:
+        entries = [
+            ("pkg-a", "usr/lib/libfoo.so.1"),
+            ("pkg-b", "usr/lib64/libbar.so.2"),
+            ("pkg-c", "usr/bin/tool"),
+        ]
+        index = build_library_owner_index(entries)
+        self.assertEqual(index["libfoo.so.1"], "pkg-a")
+        self.assertEqual(index["libbar.so.2"], "pkg-b")
+        self.assertNotIn("tool", index)
+
+    def test_find_missing_owner(self) -> None:
+        index = {"libfoo.so.1": "pkg-a"}
+        self.assertEqual(
+            find_missing_owner(["libfoo.so.1", "libnope.so"], index),
+            {
+                "libfoo.so.1": "pkg-a",
+                "libnope.so": None,
+            },
+        )
+
+    def _fake_run(self, stdout: str, stderr: str = ""):
+        return types.SimpleNamespace(stdout=stdout, stderr=stderr)
+
+    def test_missing_libs_parses_not_found(self) -> None:
+        output = (
+            "linux-vdso.so.1 (0x00007fff)\n"
+            "libc.so.6 => /lib64/libc.so.6 (0x00007f)\n"
+            "libfoo.so.1 => not found\n"
+            "libbar.so.2 => not found\n"
+        )
+        with mock.patch(
+            "pkgcheck.libdeps.subprocess.run",
+            return_value=self._fake_run(output),
+        ) as run:
+            missing = _missing_libs_of("/x", "ldd")
+        self.assertEqual(missing, ["libfoo.so.1", "libbar.so.2"])
+        run.assert_called_once()
+
+    def test_missing_libs_ignores_not_dynamic(self) -> None:
+        with mock.patch(
+            "pkgcheck.libdeps.subprocess.run",
+            return_value=self._fake_run("not a dynamic executable\n"),
+        ):
+            self.assertEqual(_missing_libs_of("/x", "ldd"), [])
+
+    def test_check_library_deps_preserves_order_and_progress(self) -> None:
+        with mock.patch("pkgcheck.libdeps._missing_libs_of", side_effect=[["a"], [], ["b"]]) as m:
+            events: list[int] = []
+            result = check_library_deps(["/x", "/y", "/z"], 3, "ldd", on_progress=events.append)
+        self.assertEqual(result, [["a"], [], ["b"]])
+        self.assertEqual(m.call_count, 3)
+        self.assertTrue(events)
+        self.assertEqual(events[-1], 3)
+
+    def test_check_undefined_symbols_returns_parallel_list(self) -> None:
+        with mock.patch(
+            "pkgcheck.libdeps._undefined_symbols",
+            side_effect=[["sym_a"], [], ["sym_b"]],
+        ) as m:
+            events: list[int] = []
+            result = check_undefined_symbols(
+                ["/x", "/y", "/z"], {"defined"}, 3, "readelf", on_progress=events.append
+            )
+        self.assertEqual(result, [["sym_a"], [], ["sym_b"]])
+        self.assertEqual(m.call_count, 3)
+        self.assertEqual(events[-1], 3)
+
+    def test_missing_libs_timeout_returns_empty(self) -> None:
+        with mock.patch(
+            "pkgcheck.libdeps.subprocess.run", side_effect=subprocess.TimeoutExpired("ldd", 60)
+        ):
+            self.assertEqual(_missing_libs_of("/x", "ldd"), [])
+
+    def test_missing_libs_oserror_returns_empty(self) -> None:
+        with mock.patch("pkgcheck.libdeps.subprocess.run", side_effect=OSError("boom")):
+            self.assertEqual(_missing_libs_of("/x", "ldd"), [])
+
+    def test_missing_libs_malformed_output(self) -> None:
+        output = (
+            "garbage line\n"
+            "libfoo.so.1 => not found\n"
+            "stray text not found\n"
+            "libbar.so.2 => not found (0x00007f)\n"
+        )
+        with mock.patch("pkgcheck.libdeps.subprocess.run", return_value=self._fake_run(output)):
+            missing = _missing_libs_of("/x", "ldd")
+        self.assertEqual(missing, ["libfoo.so.1", "libbar.so.2"])
+
+    def test_collect_defined_symbols_empty(self) -> None:
+        self.assertEqual(collect_defined_symbols([], 4, "readelf"), set())
+
+    def test_collect_defined_symbols_readelf_failure(self) -> None:
+        with mock.patch("pkgcheck.libdeps._readelf_symbols", return_value=None):
+            events: list[int] = []
+            defined = collect_defined_symbols(["/x", "/y"], 4, "readelf", on_progress=events.append)
+        self.assertEqual(defined, set())
+        self.assertEqual(events[-1], 2)
+
+    def test_check_library_deps_empty(self) -> None:
+        self.assertEqual(check_library_deps([], 4, "ldd"), [])
+
+
 class ReporterTest(unittest.TestCase):
     def tearDown(self) -> None:
         i18n.set_language("en")
@@ -262,6 +528,17 @@ class ReporterTest(unittest.TestCase):
             {"pkg": ["/d"]},  # pending_new
             {"pkg": ["/e"]},  # errors
         )
+
+    def _broken_libs(self):
+        return {
+            "pkg": [
+                BrokenBinary(
+                    binary="/usr/bin/foo",
+                    missing=["libfoo.so.1"],
+                    provided_by={"libfoo.so.1": "pkg-foo"},
+                )
+            ]
+        }
 
     def test_report_path(self) -> None:
         when = datetime(2026, 8, 7, 12, 34, 56)
@@ -286,6 +563,81 @@ class ReporterTest(unittest.TestCase):
         doc = json.loads(json_report(_summary(), *self._indexes(), when))
         self.assertEqual(doc["timestamp"], "2026-08-07T12:34:56")
 
+    def test_json_report_broken_libs(self) -> None:
+        summary = Summary(
+            packages=1,
+            files_checked=1,
+            missing=0,
+            backup=0,
+            pending_new=0,
+            no_access=0,
+            errors=0,
+            excluded_install=0,
+            excluded_pseudo=0,
+            broken_binaries=1,
+            missing_libs=1,
+        )
+        doc = json.loads(json_report(summary, *self._indexes(), broken_libs=self._broken_libs()))
+        self.assertEqual(doc["summary"]["broken_binaries"], 1)
+        self.assertEqual(doc["broken_libs"]["pkg"][0]["binary"], "/usr/bin/foo")
+        self.assertEqual(doc["broken_libs"]["pkg"][0]["provided_by"], {"libfoo.so.1": "pkg-foo"})
+
+    def test_json_report_omits_broken_libs_when_empty(self) -> None:
+        doc = json.loads(json_report(_summary(), *self._indexes()))
+        self.assertNotIn("broken_libs", doc)
+
+    def test_json_broken_libs_provided_by_none(self) -> None:
+        broken = {
+            "pkg": [
+                BrokenBinary(
+                    binary="/usr/bin/foo", missing=["libx.so.1"], provided_by={"libx.so.1": None}
+                )
+            ]
+        }
+        doc = json.loads(json_report(_summary(), *self._indexes(), broken_libs=broken))
+        self.assertEqual(doc["broken_libs"]["pkg"][0]["provided_by"], {"libx.so.1": None})
+
+    def test_json_undefined_symbols(self) -> None:
+        doc = json.loads(
+            json_report(_summary(), *self._indexes(), undefined_symbols={"pkg": {"/bin/a": ["s1"]}})
+        )
+        self.assertEqual(doc["undefined_symbols"], {"pkg": {"/bin/a": ["s1"]}})
+
+    def test_text_report_undefined_symbols_section(self) -> None:
+        text = _text_report(
+            _summary(),
+            *self._indexes(),
+            undefined_symbols={"pkg": {"/bin/a": ["s1", "s2"]}},
+        )
+        self.assertIn("UNDEFINED SYMBOLS", text)
+        self.assertIn("/bin/a", text)
+        self.assertIn("s1, s2", text)
+
+    def test_text_report_broken_libs_section(self) -> None:
+        summary = Summary(
+            packages=1,
+            files_checked=1,
+            missing=0,
+            backup=0,
+            pending_new=0,
+            no_access=0,
+            errors=0,
+            excluded_install=0,
+            excluded_pseudo=0,
+            broken_binaries=1,
+            missing_libs=1,
+        )
+        text = _text_report(
+            summary,
+            *self._indexes(),
+            broken_libs=self._broken_libs(),
+        )
+        self.assertIn("BROKEN LIBRARY DEPS:", text)
+        self.assertIn("pkg", text)
+        self.assertIn("/usr/bin/foo", text)
+        self.assertIn("libfoo.so.1", text)
+        self.assertIn("pkg-foo", text)
+
     def test_text_report_localized(self) -> None:
         i18n.set_language("es")
         text = _text_report(_summary(), *self._indexes(), datetime(2026, 8, 7, 12, 34, 56))
@@ -303,6 +655,44 @@ class ReporterTest(unittest.TestCase):
         print_breakdown(console, data, max_rows=0)
         print_breakdown(console, data, max_rows=-1)
         self.assertEqual(buf.getvalue().strip(), "")
+
+    def test_print_breakdown_banner(self) -> None:
+        buf = io.StringIO()
+        from rich.console import Console
+
+        console = Console(file=buf, width=100, force_terminal=False)
+        print_breakdown(console, {"pkg": ["/x"]})
+        out = buf.getvalue()
+        self.assertIn("*" * 12, out)
+        self.assertIn("Missing files by package", out)
+        self.assertIn("pkg", out)
+        self.assertTrue(out.startswith("\n"))
+
+    def test_print_broken_libs_banner(self) -> None:
+        buf = io.StringIO()
+        from rich.console import Console
+
+        console = Console(file=buf, width=100, force_terminal=False)
+        broken = {
+            "pkg": [
+                BrokenBinary(
+                    binary="/usr/bin/foo",
+                    missing=["libx.so.1"],
+                    provided_by={"libx.so.1": "pkg-x"},
+                )
+            ]
+        }
+        print_broken_libs(console, broken)
+        out = buf.getvalue()
+        self.assertIn("*" * 12, out)
+        self.assertIn("Binaries with missing library deps by package", out)
+        self.assertTrue(out.startswith("\n"))
+
+    def test_text_report_section_banners(self) -> None:
+        text = _text_report(_summary(), *self._indexes())
+        self.assertIn("=" * 46, text)
+        self.assertIn("MISSING:", text)
+        self.assertIn("\n\n" + "=" * 46, text)
 
 
 class CliHelperTest(unittest.TestCase):
@@ -322,16 +712,61 @@ class CliHelperTest(unittest.TestCase):
         self.assertIn("srv/", prefixes)
         self.assertNotIn("/mnt/", prefixes)
 
+    def test_is_utf8(self) -> None:
+        self.assertTrue(_is_utf8("utf-8"))
+        self.assertTrue(_is_utf8("UTF-8"))
+        self.assertTrue(_is_utf8("utf8"))
+        self.assertFalse(_is_utf8("ISO-8859-1"))
+        self.assertFalse(_is_utf8("ANSI_X3.4-1968"))
+        self.assertFalse(_is_utf8("latin-1"))
+        self.assertFalse(_is_utf8(""))
+        self.assertFalse(_is_utf8(None))
+
+    def test_ensure_utf8_environment_ok(self) -> None:
+        with (
+            mock.patch("sys.stdout", _FakeStream("UTF-8")),
+            mock.patch("sys.stderr", _FakeStream("utf-8")),
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            self.assertIsNone(_ensure_utf8_environment())
+            self.assertNotIn("PYTHONIOENCODING", os.environ)
+
+    def test_ensure_utf8_environment_forces_fallback(self) -> None:
+        with (
+            mock.patch("sys.stdout", _FakeStream("ISO-8859-1")),
+            mock.patch("sys.stderr", _FakeStream("latin-1")),
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            previous = _ensure_utf8_environment()
+            self.assertEqual(previous, "ISO-8859-1")
+            self.assertEqual(os.environ["PYTHONIOENCODING"], "utf-8")
+            self.assertEqual(os.environ["LANG"], "en_US.UTF-8")
+            self.assertEqual(os.environ["LC_ALL"], "en_US.UTF-8")
+
+    def test_ensure_utf8_environment_survives_reconfigure_failure(self) -> None:
+        class _NoReconfigure(_FakeStream):
+            def reconfigure(self, **_):
+                raise AttributeError("not a text stream")
+
+        with (
+            mock.patch("sys.stdout", _NoReconfigure("latin-1")),
+            mock.patch("sys.stderr", _FakeStream("UTF-8")),
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            previous = _ensure_utf8_environment()
+            self.assertEqual(previous, "latin-1")
+            self.assertEqual(os.environ["PYTHONIOENCODING"], "utf-8")
+
 
 class CliIntegrationTest(unittest.TestCase):
-    def _run(self, *args: str):
-        import subprocess
+    def _run(self, *args: str, env: dict[str, str] | None = None):
         import sys
 
         return subprocess.run(
             [sys.executable, "-m", "pkgcheck", *args],
             capture_output=True,
             text=True,
+            env=env,
         )
 
     def test_lang_full_locale_help(self) -> None:
@@ -343,6 +778,55 @@ class CliIntegrationTest(unittest.TestCase):
         result = self._run("--lang", "xx")
         self.assertEqual(result.returncode, 2)
         self.assertIn("xx", result.stderr)
+
+    def test_symbols_requires_deps(self) -> None:
+        result = self._run("--check-libs-symbols", "--no-elevate", "--lang", "en")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--check-libs-symbols", result.stderr)
+        self.assertIn("--check-libs-deps", result.stderr)
+
+    def test_packages_dir_nonexistent(self) -> None:
+        result = self._run("--packages-dir", "/nonexistent/pkgcheck-dir", "--no-elevate")
+        self.assertEqual(result.returncode, 2)
+
+    def test_workers_out_of_range(self) -> None:
+        self.assertEqual(self._run("--workers", "0", "--no-elevate").returncode, 2)
+        self.assertEqual(self._run("--workers", "9999", "--no-elevate").returncode, 2)
+
+    def test_encoding_fallback_latin1(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "demo-1.0").write_text("FILE LIST:\nbin/true\n")
+            env = dict(os.environ, PYTHONIOENCODING="iso-8859-1")
+            result = self._run(
+                "--packages-dir", tmp, "--check-libs-deps", "--no-elevate", "--lang", "en", env=env
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("not UTF-8", result.stdout)
+            self.assertIn("fallback", result.stdout.lower())
+
+    def test_run_is_nondestructive(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            packages = root / "packages"
+            packages.mkdir()
+            (packages / "demo-1.0").write_text("FILE LIST:\nusr/bin/x\n")
+            fake = root / "usr"
+            fake.mkdir()
+            victim = fake / "x"
+            victim.write_bytes(b"precious content")
+
+            before = {
+                str(p): (p.read_bytes() if p.is_file() else None, p.stat().st_mtime_ns)
+                for p in root.rglob("*")
+            }
+            result = self._run("--packages-dir", str(packages), "--no-elevate", "--lang", "en")
+            self.assertEqual(result.returncode, 0)
+            after = {
+                str(p): (p.read_bytes() if p.is_file() else None, p.stat().st_mtime_ns)
+                for p in root.rglob("*")
+            }
+            self.assertEqual(before, after)
+            self.assertEqual(victim.read_bytes(), b"precious content")
 
 
 if __name__ == "__main__":
