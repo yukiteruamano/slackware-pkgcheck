@@ -9,6 +9,17 @@ All notable changes to this project will be documented in this file.
 ### Added
 - (unreleased changes will be listed here)
 
+## [0.3.1] - 2026-08-21
+### Fixed
+- `libdeps` clean console: `build_library_owner_index` now last-wins silently — removed 10+ `RuntimeWarning: Library libVkLayer_khronos_validation.so / libxul.so / libmoz* provided by multiple packages ...` spam from `--check-lib-deps` (chromium/vulkan-sdk, firefox/thunderbird duplicates).
+
+### Changed
+- `libdeps` migrated from `readelf` subprocess to `pyelftools` (`ELFFile`/`DynamicSection` `DT_NEEDED` + `.dynsym`) for `DT_NEEDED`/`--check-libs-symbols`; `readelf` now optional fallback. Wall time `>4 min` → `<30s` via no-fork parsing + `ThreadPoolExecutor`.
+- `libdeps` `check_library_deps`/`collect_defined_symbols`/`check_undefined_symbols` no longer emit `RuntimeWarning` on future exceptions.
+
+### Dependencies
+- Added `pyelftools>=0.29` (0.33).
+
 ## [0.2.0] - 2026-08-07
 ### Added
 - `--check-libs-deps` (`ldd` revdep-rebuild style) with `broken_libs` JSON/report.
