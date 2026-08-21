@@ -507,19 +507,16 @@ def main() -> None:
         if not orphans_root.is_dir():
             parser.error(t("orphans root does not exist: {path}").format(path=orphans_root))
 
-    readelf_bin = None
-    if args.check_lib_deps or args.check_libs_symbols:
-        readelf_bin = shutil.which("readelf")
-        if readelf_bin is None:
-            parser.error(
-                t(
-                    "readelf was not found on the system; it is required for --check-lib-deps/--check-libs-symbols"
-                )
-            )
+    # readelf is optional now: pyelftools is primary, readelf only fallback
+    readelf_bin: str | None = shutil.which("readelf")
+    if readelf_bin is not None:
         try:
             readelf_bin = validate_binary_path(readelf_bin)
         except ValidationError as exc:
             parser.error(t("invalid readelf binary path: {exc}").format(exc=exc))
+    elif args.check_lib_deps or args.check_libs_symbols:
+        # No readelf — pyelftools will handle it; keep None for fallback logic
+        readelf_bin = None
 
     try:
         _run(console, status_console, args, packages_dir, rg_bin, readelf_bin, subprocess_env)
@@ -761,7 +758,6 @@ def _run(
         orphans = find_orphans(owned_set, root=orphans_root, extra_exclude=extra_for_orphans)
     if args.check_lib_deps:
         assert elf_flags is not None
-        assert readelf_bin is not None
         elf_entries = [
             (package, rel)
             for (package, rel), is_elf in zip(entries, elf_flags, strict=True)
@@ -777,10 +773,12 @@ def _run(
                 deps_task = progress.add_task(
                     t("Checking library dependencies (readelf)..."), total=len(elf_paths)
                 )
+                # readelf_bin is optional (pyelftools primary); pass "" if None for compat
+                effective_readelf = readelf_bin or ""
                 missing_per_path = check_library_deps(
                     elf_paths,
                     args.workers,
-                    readelf_bin,
+                    effective_readelf,
                     owner_index,
                     on_progress=lambda done: progress.update(deps_task, completed=done),
                     extra_env=subprocess_env,
@@ -797,7 +795,7 @@ def _run(
                 missing_lib_count += len(missing)
 
             if args.check_libs_symbols:
-                assert readelf_bin is not None
+                effective_readelf = readelf_bin or ""
                 with Progress(
                     *progress_columns, console=status, disable=args.quiet or args.json
                 ) as progress:
@@ -807,7 +805,7 @@ def _run(
                     defined = collect_defined_symbols(
                         elf_paths,
                         args.workers,
-                        readelf_bin,
+                        effective_readelf,
                         on_progress=lambda done: progress.update(sym_task, completed=done),
                         extra_env=subprocess_env,
                     )
@@ -821,7 +819,7 @@ def _run(
                         elf_paths,
                         defined,
                         args.workers,
-                        readelf_bin,
+                        effective_readelf,
                         on_progress=lambda done: progress.update(undef_task, completed=done),
                         extra_env=subprocess_env,
                     )

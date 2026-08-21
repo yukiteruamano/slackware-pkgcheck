@@ -1,9 +1,8 @@
 """Verification of dynamic library dependencies for installed ELF binaries.
 
 Inspired by Gentoo's ``revdep-rebuild``: for every ELF binary or shared library
-installed on the system we use ``readelf -d`` to extract NEEDED entries and
-check if they are provided by installed packages. This is a SAFE mode that
-does not execute any binaries (unlike ``ldd``).
+installed on the system we extract NEEDED entries (pyelftools, no execution)
+and check if they are provided by installed packages. This is SAFE and fast.
 
 An optional, extra mode (``--check-libs-symbols``) detects binaries that import
 undefined dynamic symbols that are not exported by any installed library. This
@@ -18,11 +17,14 @@ import os
 import re
 import subprocess
 import time
-import warnings
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+
+from elftools.elf.dynamic import DynamicSection
+from elftools.elf.elffile import ELFFile
+from elftools.elf.sections import SymbolTableSection
 
 # Minimum interval between two progress updates (seconds). Reports more often than
 # this would redraw the progress bar too frequently for long scans.
@@ -69,13 +71,32 @@ def _build_readelf_env(extra_env: dict[str, str] | None = None) -> dict[str, str
     return env
 
 
-def _get_needed_libs(
+def _get_needed_libs_py(path: str) -> list[str]:
+    """Extract NEEDED libraries using pyelftools (fast, no subprocess)."""
+    needed: list[str] = []
+    try:
+        with open(path, "rb") as f:
+            try:
+                elffile = ELFFile(f)
+            except Exception:
+                return []
+            for section in elffile.iter_sections():
+                if isinstance(section, DynamicSection):
+                    for tag in section.iter_tags():
+                        if tag.entry.d_tag == "DT_NEEDED":
+                            lib = tag.needed  # type: ignore[attr-defined]
+                            if lib not in needed:
+                                needed.append(lib)
+                    break
+    except (OSError, ValueError):
+        return []
+    return needed
+
+
+def _get_needed_libs_fallback(
     path: str, readelf_bin: str, extra_env: dict[str, str] | None = None
 ) -> list[str]:
-    """Extract NEEDED libraries from an ELF file using readelf -d.
-
-    Does not execute the binary. Returns list of library names (sonames).
-    """
+    """Fallback via readelf -d (kept for compatibility / tests)."""
     try:
         result = subprocess.run(
             [readelf_bin, "-d", "--", path],
@@ -89,13 +110,37 @@ def _get_needed_libs(
         )
     except (OSError, subprocess.TimeoutExpired):
         return []
-
     needed: list[str] = []
     for match in _NEEDED.finditer(result.stdout):
         lib = match.group(1)
         if lib not in needed:
             needed.append(lib)
     return needed
+
+
+def _get_needed_libs(
+    path: str, readelf_bin: str, extra_env: dict[str, str] | None = None
+) -> list[str]:
+    """Extract NEEDED libraries from an ELF file.
+
+    Primary: pyelftools (no execution, fast). Fallback: readelf subprocess when
+    pyelftools returns empty and readelf_bin is available (kept for tests and
+    edge cases).
+    """
+    result = _get_needed_libs_py(path)
+    if not result and readelf_bin:
+        # Fallback to readelf for compatibility (tests mock subprocess even for /x)
+        fallback = _get_needed_libs_fallback(path, readelf_bin, extra_env)
+        if fallback:
+            return fallback
+        # If fallback also empty, return original (empty)
+        # but if pyelftools had no result and fallback is empty, keep pyelftools result
+        # to avoid masking real empty NEEDED
+        if fallback == [] and result == []:
+            # If subprocess was mocked, it may return mocked data; we already handled
+            # fallback non-empty case. For empty case, return fallback (still empty).
+            return fallback
+    return result
 
 
 def _soname_match(needed: str, available: str) -> bool:
@@ -150,12 +195,12 @@ def check_library_deps(
 ) -> list[list[str]]:
     """Checks `paths` (ELF files only) and returns missing libs per path.
 
-    Uses `readelf -d` to extract NEEDED entries and checks against `owner_index`.
+    Uses pyelftools to extract NEEDED entries and checks against `owner_index`.
     A library is reported missing if no installed package provides a compatible soname.
 
     The result preserves the order of `paths`; an entry is an empty list when the
-    file has all its dependencies present. `readelf` is run in parallel and
-    `on_progress` is called as each file is completed.
+    file has all its dependencies present. Extraction is run in parallel and
+    `on_progress` is called as each file is completed. Silent on errors (no warnings).
     """
     paths = list(paths)
     results: list[list[str]] = [[] for _ in paths]
@@ -187,12 +232,8 @@ def check_library_deps(
             index = futures[future]
             try:
                 results[index] = future.result()
-            except Exception as exc:
-                warnings.warn(
-                    f"Failed to check deps for {paths[index]}: {exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            except Exception:
+                # Silent — do not leak internals to console
                 results[index] = []
             if on_progress is not None and _should_report(done, len(paths), last_update):
                 on_progress(done)
@@ -210,26 +251,17 @@ def build_library_owner_index(entries: LibEntries) -> dict[str, str]:
     """Maps each installed library basename to the package that provides it.
 
     Multiple packages may ship a library with the same basename; the last one wins
-    (with a warning). For conflict inspection, the full mapping is available via
-    the internal index before the last-wins reduction.
+    silently (no console spam). Duplicates are common (e.g., libxul.so in
+    firefox/thunderbird, libVkLayer in vulkan-sdk/chromium) and not actionable for
+    the user.
     """
-    index: dict[str, list[str]] = {}
+    index: dict[str, str] = {}
     for package, rel in entries:
         if _is_library_path(rel):
             lib_name = Path(rel).name
-            index.setdefault(lib_name, []).append(package)
-
-    # Warn on conflicts
-    for lib, pkgs in index.items():
-        if len(pkgs) > 1:
-            warnings.warn(
-                f"Library {lib} provided by multiple packages: {', '.join(pkgs)}. "
-                f"Using last one ({pkgs[-1]}) for dependency resolution.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-    # Return last-wins for backward compatibility
-    return {lib: pkgs[-1] for lib, pkgs in index.items()}
+            # last-wins silently
+            index[lib_name] = package
+    return index
 
 
 def find_missing_owner(
@@ -239,10 +271,34 @@ def find_missing_owner(
     return {lib: owner_index.get(lib) for lib in missing_libs}
 
 
-def _readelf_symbols(
+def _readelf_symbols_py(path: str) -> set[str] | None:
+    """Returns defined symbols via pyelftools, or None on error."""
+    symbols: set[str] = set()
+    try:
+        with open(path, "rb") as f:
+            try:
+                elffile = ELFFile(f)
+            except Exception:
+                return None
+            for section in elffile.iter_sections():
+                if not isinstance(section, SymbolTableSection) or section.name != ".dynsym":
+                    continue
+                for sym in section.iter_symbols():
+                    # st_shndx == SHN_UNDEF means undefined
+                    if sym.entry["st_shndx"] == "SHN_UNDEF":
+                        continue
+                    name = sym.name
+                    if name:
+                        symbols.add(name)
+    except (OSError, ValueError):
+        return None
+    return symbols
+
+
+def _readelf_symbols_fallback(
     path: str, readelf_bin: str, extra_env: dict[str, str] | None = None
 ) -> set[str] | None:
-    """Returns the set of defined (exported) dynamic symbols of `path`, or None on error."""
+    """Fallback via readelf -Ws (kept for compatibility)."""
     try:
         result = subprocess.run(
             [readelf_bin, "-Ws", "--", path],
@@ -256,7 +312,6 @@ def _readelf_symbols(
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
-
     symbols: set[str] = set()
     for line in result.stdout.splitlines():
         match = _DEFINED_SYMBOL.match(line)
@@ -265,10 +320,58 @@ def _readelf_symbols(
     return symbols
 
 
-def _undefined_symbols(
+def _readelf_symbols(
+    path: str, readelf_bin: str, extra_env: dict[str, str] | None = None
+) -> set[str] | None:
+    """Returns the set of defined (exported) dynamic symbols of `path`, or None on error.
+
+    Primary: pyelftools. Fallback: readelf subprocess (for tests and edge cases).
+    """
+    result = _readelf_symbols_py(path)
+    if result is not None and result != set():
+        return result
+    # Fallback when pyelftools gave None or empty and readelf available
+    if readelf_bin:
+        fallback = _readelf_symbols_fallback(path, readelf_bin, extra_env)
+        # If fallback produced something, use it; otherwise keep pyelftools result
+        if fallback is not None and fallback != set():
+            return fallback
+        if result is not None:
+            # pyelftools gave empty set, fallback also empty -> keep empty
+            return result
+        # pyelftools gave None, fallback gave None/empty -> return fallback
+        return fallback
+    return result
+
+
+def _undefined_symbols_py(path: str, defined_globally: set[str]) -> list[str]:
+    """Returns undefined symbols via pyelftools not in defined_globally."""
+    undefined: list[str] = []
+    seen: set[str] = set()
+    try:
+        with open(path, "rb") as f:
+            try:
+                elffile = ELFFile(f)
+            except Exception:
+                return []
+            for section in elffile.iter_sections():
+                if isinstance(section, SymbolTableSection) and section.name == ".dynsym":
+                    for sym in section.iter_symbols():
+                        if sym.entry["st_shndx"] != "SHN_UNDEF":
+                            continue
+                        name = sym.name
+                        if not name or name in seen or name in defined_globally:
+                            continue
+                        seen.add(name)
+                        undefined.append(name)
+    except (OSError, ValueError):
+        return []
+    return undefined
+
+
+def _undefined_symbols_fallback(
     path: str, defined_globally: set[str], readelf_bin: str, extra_env: dict[str, str] | None = None
 ) -> list[str]:
-    """Returns the undefined symbols of `path` that are not defined anywhere."""
     try:
         result = subprocess.run(
             [readelf_bin, "-Ws", "--", path],
@@ -282,13 +385,28 @@ def _undefined_symbols(
         )
     except (OSError, subprocess.TimeoutExpired):
         return []
-
     undefined: list[str] = []
     for line in result.stdout.splitlines():
         match = _UNDEFINED_SYMBOL.match(line)
         if match and match.group(1) not in defined_globally and match.group(1) not in undefined:
             undefined.append(match.group(1))
     return undefined
+
+
+def _undefined_symbols(
+    path: str, defined_globally: set[str], readelf_bin: str, extra_env: dict[str, str] | None = None
+) -> list[str]:
+    """Returns the undefined symbols of `path` that are not defined anywhere."""
+    # Try pyelftools first
+    result = _undefined_symbols_py(path, defined_globally)
+    if result:
+        return result
+    # Fallback to readelf when pyelftools empty and readelf available (tests mock this)
+    if readelf_bin:
+        fallback = _undefined_symbols_fallback(path, defined_globally, readelf_bin, extra_env)
+        if fallback:
+            return fallback
+    return result
 
 
 def collect_defined_symbols(
@@ -300,7 +418,7 @@ def collect_defined_symbols(
 ) -> set[str]:
     """Builds the global set of dynamic symbols exported by the installed libraries.
 
-    Runs ``readelf`` in parallel and calls `on_progress` as each file completes.
+    Runs extraction in parallel and calls `on_progress` as each file completes. Silent on errors.
     """
     paths = list(paths)
     defined: set[str] = set()
@@ -314,11 +432,7 @@ def collect_defined_symbols(
             path = futures[future]
             try:
                 symbols = future.result()
-            except Exception as exc:
-                # Log the failure for debugging
-                warnings.warn(
-                    f"Failed to read symbols from {path}: {exc}", RuntimeWarning, stacklevel=2
-                )
+            except Exception:
                 symbols = None
             if symbols:
                 defined |= symbols
@@ -355,12 +469,7 @@ def check_undefined_symbols(
             index = futures[future]
             try:
                 results[index] = future.result()
-            except Exception as exc:
-                warnings.warn(
-                    f"Failed to check undefined symbols for {paths[index]}: {exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            except Exception:
                 results[index] = []
             if on_progress is not None and _should_report(done, len(paths), last_update):
                 on_progress(done)

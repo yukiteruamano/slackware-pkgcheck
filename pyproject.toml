@@ -18,7 +18,10 @@ classifiers = [
     "Topic :: System :: Systems Administration",
     "Topic :: Utilities",
 ]
-dependencies = ["rich>=15.0.0,<16"]
+dependencies = [
+    "rich>=15.0.0,<16",
+    "pyelftools>=0.29",
+]
 
 [project.urls]
 Repository = "https://github.com/yukiteruamano/slackware-pkgcheck"
@@ -65,6 +68,7 @@ convention = "google"
 "src/pkgcheck/cli.py" = ["S603", "S606", "S607"]
 "src/pkgcheck/scanner.py" = ["SIM110"]
 "src/pkgcheck/reporter.py" = ["PTH105", "PTH108", "SIM105"]
+"src/pkgcheck/libdeps.py" = ["PTH123"]
 
 [tool.ruff.format]
 quote-style = "double"

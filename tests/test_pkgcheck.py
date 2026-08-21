@@ -1898,8 +1898,7 @@ class CliMainCoverageTest(unittest.TestCase):
                 self.assertEqual(cm.exception.code, 2)
 
     def test_main_ldd_not_found(self) -> None:
-        # This test is no longer relevant since we removed ldd
-        # But keep it to verify --check-lib-deps requires readelf
+        # readelf is now optional (pyelftools primary), so --check-lib-deps without readelf should succeed
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 mock.patch.object(
@@ -1910,15 +1909,19 @@ class CliMainCoverageTest(unittest.TestCase):
                 mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
                 mock.patch("pkgcheck.cli._ensure_root"),
                 mock.patch("pkgcheck.cli.Console"),
+                mock.patch("pkgcheck.cli._run") as mock_run,
                 mock.patch(
                     "shutil.which", side_effect=lambda x: "/usr/bin/rg" if x == "rg" else None
                 ),
             ):
-                with self.assertRaises(SystemExit) as cm:
-                    import pkgcheck.cli
+                import pkgcheck.cli
 
+                # Should not raise SystemExit 2, pyelftools handles it
+                try:
                     pkgcheck.cli.main()
-                self.assertEqual(cm.exception.code, 2)
+                except SystemExit as e:
+                    self.assertNotEqual(e.code, 2)
+                mock_run.assert_called_once()
 
     def test_main_success_with_mocks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1997,6 +2000,7 @@ class CliMainCoverageTest(unittest.TestCase):
                 self.assertTrue(mock_console.print.called)
 
     def test_main_readelf_not_found(self) -> None:
+        # readelf now optional (pyelftools primary), both flags without readelf should succeed
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 mock.patch.object(
@@ -2014,16 +2018,19 @@ class CliMainCoverageTest(unittest.TestCase):
                 mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
                 mock.patch("pkgcheck.cli._ensure_root"),
                 mock.patch("pkgcheck.cli.Console"),
+                mock.patch("pkgcheck.cli._run") as mock_run,
                 mock.patch(
                     "shutil.which",
                     side_effect=lambda x: "/usr/bin/rg" if x == "rg" else None,
                 ),
             ):
-                with self.assertRaises(SystemExit) as cm:
-                    import pkgcheck.cli
+                import pkgcheck.cli
 
+                try:
                     pkgcheck.cli.main()
-                self.assertEqual(cm.exception.code, 2)
+                except SystemExit as e:
+                    self.assertNotEqual(e.code, 2)
+                mock_run.assert_called_once()
 
 
 class ScannerCoverageTest(unittest.TestCase):
