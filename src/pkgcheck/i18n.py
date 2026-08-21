@@ -62,7 +62,7 @@ def _os_code() -> str | None:
     for key in _LOCALE_ENV_KEYS:
         value = os.environ.get(key)
         if value:
-            if value in ("C", "POSIX"):
+            if value in ("C", "POSIX", "C.UTF-8"):
                 return None
             return value.split(".", 1)[0]
     try:

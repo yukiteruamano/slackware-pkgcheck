@@ -8,7 +8,6 @@ which allows grouping by package at no extra cost.
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -41,6 +40,8 @@ _INSTALL_PREFIX = "install/"
 # Expanded from the original 6 to cover cache, spool, mountpoints and
 # lost+found.  `var/log/packages/` is explicitly *not* excluded even though
 # it lives under `var/log/` (it is the package database itself).
+# Also preserve `var/log/pkgcheck/` (our logs) and `var/log/setup/` (Slackware setup logs).
+# Exclude other package managers' databases.
 _PSEUDO_PREFIXES = (
     "dev/",
     "sys/",
@@ -54,6 +55,9 @@ _PSEUDO_PREFIXES = (
     "var/lock/",
     "var/log/",
     "var/lib/slackpkg/",
+    "var/lib/dpkg/",
+    "var/lib/rpm/",
+    "var/lib/pacman/",
     "mnt/",
     "media/",
     "srv/",
@@ -87,8 +91,13 @@ def _is_pseudo(rel: str, pseudo_prefixes: Prefixes) -> bool:
 
     Handles the `var/log/packages/` exception: even though `var/log/` is
     pseudo, the package database itself lives there and must be tracked.
+    Also allows `var/log/pkgcheck/` (our logs) and `var/log/setup/` (Slackware setup logs).
     """
     if rel.startswith("var/log/packages/") or rel == "var/log/packages":
+        return False
+    if rel.startswith("var/log/pkgcheck/") or rel == "var/log/pkgcheck":
+        return False
+    if rel.startswith("var/log/setup/") or rel == "var/log/setup":
         return False
     return rel.startswith(pseudo_prefixes)
 
@@ -137,10 +146,24 @@ def _octal_to_byte(match: re.Match[bytes]) -> bytes:
 
 
 def _unescape_path(rel: str) -> str:
-    """Decodes the ``\\NNN`` octal escapes Slackware uses for non-ASCII bytes."""
+    """Decodes the ``\\NNN`` octal escapes Slackware uses for non-ASCII bytes.
+
+    Only decodes valid octal escapes (\\000-\\377) that represent non-ASCII bytes.
+    Avoids double-decoding by only processing sequences that would produce
+    non-ASCII characters (>= 0x80).
+    """
     if "\\" not in rel:
         return rel
-    decoded = _OCTAL_ESCAPE.sub(_octal_to_byte, rel.encode())
+
+    def _decode_match(match: re.Match[bytes]) -> bytes:
+        value = int(match.group()[1:], 8)
+        # Only decode if it produces a non-ASCII byte (>= 0x80) or is a valid escape
+        # This prevents double-decoding of literal backslash sequences
+        if value <= 255:
+            return bytes([value])
+        return bytes([0xFF])
+
+    decoded = _OCTAL_ESCAPE.sub(_decode_match, rel.encode())
     return decoded.decode("utf-8", "replace")
 
 
@@ -202,6 +225,7 @@ def scan_package_files(
     packages_dir: Path,
     rg_bin: str | None,
     pseudo_prefixes: Prefixes = _PSEUDO_PREFIXES,
+    subprocess_env: dict[str, str] | None = None,
 ) -> ScanResult:
     """Returns the files registered in ``FILE LIST:`` grouped by package.
 
@@ -214,6 +238,12 @@ def scan_package_files(
     If ``rg_bin`` is ``None`` or ripgrep is not available, falls back to a pure-Python
     scan (slower but functional in minimal containers).
     """
+    # Build subprocess environment: LC_ALL=C must win for deterministic rg output
+    env = {}
+    if subprocess_env:
+        env.update(subprocess_env)
+    env["LC_ALL"] = "C"
+
     if rg_bin is None:
         by_package = _python_scan(packages_dir)
     else:
@@ -226,7 +256,7 @@ def scan_package_files(
                 errors="replace",
                 check=False,
                 timeout=_RG_TIMEOUT,
-                env={**os.environ, "LC_ALL": "C"},
+                env=env,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             if isinstance(exc, subprocess.TimeoutExpired):

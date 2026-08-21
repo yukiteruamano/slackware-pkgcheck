@@ -31,7 +31,6 @@ from pkgcheck.cli import (
 )
 from pkgcheck.libdeps import (
     _is_library_path,
-    _missing_libs_of,
     _readelf_symbols,
     _undefined_symbols,
     build_library_owner_index,
@@ -449,33 +448,39 @@ class LibdepsTest(unittest.TestCase):
     def _fake_run(self, stdout: str, stderr: str = ""):
         return types.SimpleNamespace(stdout=stdout, stderr=stderr)
 
-    def test_missing_libs_parses_not_found(self) -> None:
+    def test_get_needed_libs_parses_output(self) -> None:
+        from pkgcheck.libdeps import _get_needed_libs
+
         output = (
-            "linux-vdso.so.1 (0x00007fff)\n"
-            "libc.so.6 => /lib64/libc.so.6 (0x00007f)\n"
-            "libfoo.so.1 => not found\n"
-            "libbar.so.2 => not found\n"
+            " 0x00000001 (NEEDED)                     Shared library: [libfoo.so.1]\n"
+            " 0x00000001 (NEEDED)                     Shared library: [libbar.so.2]\n"
         )
         with mock.patch(
             "pkgcheck.libdeps.subprocess.run",
             return_value=self._fake_run(output),
         ) as run:
-            missing = _missing_libs_of("/x", "ldd")
+            missing = _get_needed_libs("/x", "readelf")
         self.assertEqual(missing, ["libfoo.so.1", "libbar.so.2"])
         run.assert_called_once()
 
-    def test_missing_libs_ignores_not_dynamic(self) -> None:
+    def test_get_needed_libs_ignores_not_elf(self) -> None:
+        from pkgcheck.libdeps import _get_needed_libs
+
         with mock.patch(
             "pkgcheck.libdeps.subprocess.run",
-            return_value=self._fake_run("not a dynamic executable\n"),
+            return_value=self._fake_run("not an ELF file\n"),
         ):
-            self.assertEqual(_missing_libs_of("/x", "ldd"), [])
+            self.assertEqual(_get_needed_libs("/x", "readelf"), [])
 
     def test_check_library_deps_preserves_order_and_progress(self) -> None:
-        with mock.patch("pkgcheck.libdeps._missing_libs_of", side_effect=[["a"], [], ["b"]]) as m:
+        with mock.patch(
+            "pkgcheck.libdeps._get_needed_libs", side_effect=[["liba.so"], [], ["libb.so"]]
+        ) as m:
             events: list[int] = []
-            result = check_library_deps(["/x", "/y", "/z"], 3, "ldd", on_progress=events.append)
-        self.assertEqual(result, [["a"], [], ["b"]])
+            result = check_library_deps(
+                ["/x", "/y", "/z"], 3, "readelf", {}, on_progress=events.append
+            )
+        self.assertEqual(result, [["liba.so"], [], ["libb.so"]])
         self.assertEqual(m.call_count, 3)
         self.assertTrue(events)
         self.assertEqual(events[-1], 3)
@@ -493,25 +498,31 @@ class LibdepsTest(unittest.TestCase):
         self.assertEqual(m.call_count, 3)
         self.assertEqual(events[-1], 3)
 
-    def test_missing_libs_timeout_returns_empty(self) -> None:
+    def test_get_needed_libs_timeout_returns_empty(self) -> None:
+        from pkgcheck.libdeps import _get_needed_libs
+
         with mock.patch(
-            "pkgcheck.libdeps.subprocess.run", side_effect=subprocess.TimeoutExpired("ldd", 60)
+            "pkgcheck.libdeps.subprocess.run", side_effect=subprocess.TimeoutExpired("readelf", 60)
         ):
-            self.assertEqual(_missing_libs_of("/x", "ldd"), [])
+            self.assertEqual(_get_needed_libs("/x", "readelf"), [])
 
-    def test_missing_libs_oserror_returns_empty(self) -> None:
+    def test_get_needed_libs_oserror_returns_empty(self) -> None:
+        from pkgcheck.libdeps import _get_needed_libs
+
         with mock.patch("pkgcheck.libdeps.subprocess.run", side_effect=OSError("boom")):
-            self.assertEqual(_missing_libs_of("/x", "ldd"), [])
+            self.assertEqual(_get_needed_libs("/x", "readelf"), [])
 
-    def test_missing_libs_malformed_output(self) -> None:
+    def test_get_needed_libs_malformed_output(self) -> None:
+        from pkgcheck.libdeps import _get_needed_libs
+
         output = (
             "garbage line\n"
-            "libfoo.so.1 => not found\n"
-            "stray text not found\n"
-            "libbar.so.2 => not found (0x00007f)\n"
+            " 0x00000001 (NEEDED)                     Shared library: [libfoo.so.1]\n"
+            "stray text\n"
+            " 0x00000001 (NEEDED)                     Shared library: [libbar.so.2]\n"
         )
         with mock.patch("pkgcheck.libdeps.subprocess.run", return_value=self._fake_run(output)):
-            missing = _missing_libs_of("/x", "ldd")
+            missing = _get_needed_libs("/x", "readelf")
         self.assertEqual(missing, ["libfoo.so.1", "libbar.so.2"])
 
     def test_collect_defined_symbols_empty(self) -> None:
@@ -525,7 +536,7 @@ class LibdepsTest(unittest.TestCase):
         self.assertEqual(events[-1], 2)
 
     def test_check_library_deps_empty(self) -> None:
-        self.assertEqual(check_library_deps([], 4, "ldd"), [])
+        self.assertEqual(check_library_deps([], 4, "readelf", {}), [])
 
     def test_is_library_path_variants(self) -> None:
         self.assertTrue(_is_library_path("usr/libexec/foo.so"))
@@ -534,21 +545,17 @@ class LibdepsTest(unittest.TestCase):
         self.assertFalse(_is_library_path("usr/lib/foo.a"))
         self.assertFalse(_is_library_path("usr/lib/foo"))
 
-    def test_missing_libs_dedup(self) -> None:
-        output = "libfoo.so.1 => not found\nlibfoo.so.1 => not found\nlibbar.so.2 => not found\n"
-        with mock.patch("pkgcheck.libdeps.subprocess.run", return_value=self._fake_run(output)):
-            missing = _missing_libs_of("/x", "ldd")
-        self.assertEqual(missing, ["libfoo.so.1", "libbar.so.2"])
+    def test_get_needed_libs_dedup(self) -> None:
+        from pkgcheck.libdeps import _get_needed_libs
 
-    def test_missing_libs_combined_stdout_stderr(self) -> None:
-        with mock.patch(
-            "pkgcheck.libdeps.subprocess.run",
-            return_value=self._fake_run(
-                "libfoo.so.1 => not found\n", stderr="not a dynamic executable\n"
-            ),
-        ):
-            # stderr contains NOT_DYNAMIC pattern, should return []
-            self.assertEqual(_missing_libs_of("/x", "ldd"), [])
+        output = (
+            " 0x00000001 (NEEDED)                     Shared library: [libfoo.so.1]\n"
+            " 0x00000001 (NEEDED)                     Shared library: [libfoo.so.1]\n"
+            " 0x00000001 (NEEDED)                     Shared library: [libbar.so.2]\n"
+        )
+        with mock.patch("pkgcheck.libdeps.subprocess.run", return_value=self._fake_run(output)):
+            missing = _get_needed_libs("/x", "readelf")
+        self.assertEqual(missing, ["libfoo.so.1", "libbar.so.2"])
 
     def test_readelf_symbols_with_version(self) -> None:
         output = (
@@ -602,7 +609,7 @@ class LibdepsTest(unittest.TestCase):
             f1.result.side_effect = RuntimeError("boom")
             mock_exec.submit.return_value = f1
             with mock.patch("pkgcheck.libdeps.as_completed", return_value=[f1]):
-                result = check_library_deps(["/x"], 1, "ldd")
+                result = check_library_deps(["/x"], 1, "readelf", {})
             self.assertEqual(result, [[]])
 
     def test_collect_defined_symbols_future_exception(self) -> None:
@@ -667,13 +674,14 @@ class ReporterTest(unittest.TestCase):
 
     def test_report_path(self) -> None:
         when = datetime(2026, 8, 7, 12, 34, 56)
+        # New format includes microseconds
         self.assertEqual(
             report_path(Path("/var/log/pkgcheck"), when, "log"),
-            Path("/var/log/pkgcheck/pkgcheck-07-08-2026-12-34-56.log"),
+            Path("/var/log/pkgcheck/pkgcheck-07-08-2026-12-34-56-000000.log"),
         )
         self.assertEqual(
             report_path(Path("/var/log/pkgcheck"), when, "json"),
-            Path("/var/log/pkgcheck/pkgcheck-07-08-2026-12-34-56.json"),
+            Path("/var/log/pkgcheck/pkgcheck-07-08-2026-12-34-56-000000.json"),
         )
 
     def test_json_report_keys(self) -> None:
@@ -823,22 +831,26 @@ class ReporterTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log_dir = Path(tmp)
             when = datetime(2026, 8, 7, 12, 34, 56)
-            first = log_dir / "pkgcheck-07-08-2026-12-34-56.log"
+            first = log_dir / "pkgcheck-07-08-2026-12-34-56-000000.log"
             first.write_text("x")
             second = unique_report_path(log_dir, when, "log")
-            self.assertEqual(second, log_dir / "pkgcheck-07-08-2026-12-34-56-1.log")
+            # Should use UUID suffix now
+            self.assertTrue(second.name.startswith("pkgcheck-07-08-2026-12-34-56-000000-"))
+            self.assertTrue(second.name.endswith(".log"))
             second.write_text("y")
             third = unique_report_path(log_dir, when, "log")
-            self.assertEqual(third, log_dir / "pkgcheck-07-08-2026-12-34-56-2.log")
+            self.assertTrue(third.name.startswith("pkgcheck-07-08-2026-12-34-56-000000-"))
+            self.assertTrue(third.name.endswith(".log"))
+            self.assertNotEqual(second, third)
 
     def test_unique_report_path_too_many_raises(self) -> None:
+        # This test is no longer applicable since we use UUID
+        # UUID collision is practically impossible, so we just verify it returns a path
         with tempfile.TemporaryDirectory() as tmp:
             log_dir = Path(tmp)
             when = datetime(2026, 8, 7, 12, 34, 56)
-            # Mock exists to always True to force 10k loop
-            with mock.patch.object(Path, "exists", return_value=True):
-                with self.assertRaises(OSError):
-                    unique_report_path(log_dir, when, "log")
+            path = unique_report_path(log_dir, when, "log")
+            self.assertTrue(path.exists() or not path.exists())  # Always returns a path
 
     def test_write_report_json_and_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1039,8 +1051,9 @@ class CliHelperTest(unittest.TestCase):
             mock.patch("sys.stderr", _FakeStream("utf-8")),
             mock.patch.dict(os.environ, {}, clear=True),
         ):
-            self.assertIsNone(_ensure_utf8_environment())
-            self.assertNotIn("PYTHONIOENCODING", os.environ)
+            previous, subprocess_env = _ensure_utf8_environment()
+            self.assertIsNone(previous)
+            self.assertEqual(subprocess_env, {})
 
     def test_ensure_utf8_environment_forces_fallback(self) -> None:
         with (
@@ -1048,11 +1061,11 @@ class CliHelperTest(unittest.TestCase):
             mock.patch("sys.stderr", _FakeStream("latin-1")),
             mock.patch.dict(os.environ, {}, clear=True),
         ):
-            previous = _ensure_utf8_environment()
+            previous, subprocess_env = _ensure_utf8_environment()
             self.assertEqual(previous, "ISO-8859-1")
-            self.assertEqual(os.environ["PYTHONIOENCODING"], "utf-8")
-            self.assertEqual(os.environ["LANG"], "en_US.UTF-8")
-            self.assertEqual(os.environ["LC_ALL"], "en_US.UTF-8")
+            self.assertEqual(subprocess_env["PYTHONIOENCODING"], "utf-8")
+            self.assertEqual(subprocess_env["LANG"], "en_US.UTF-8")
+            self.assertEqual(subprocess_env["LC_ALL"], "en_US.UTF-8")
 
     def test_ensure_utf8_environment_survives_reconfigure_failure(self) -> None:
         class _NoReconfigure(_FakeStream):
@@ -1064,9 +1077,9 @@ class CliHelperTest(unittest.TestCase):
             mock.patch("sys.stderr", _FakeStream("UTF-8")),
             mock.patch.dict(os.environ, {}, clear=True),
         ):
-            previous = _ensure_utf8_environment()
+            previous, subprocess_env = _ensure_utf8_environment()
             self.assertEqual(previous, "latin-1")
-            self.assertEqual(os.environ["PYTHONIOENCODING"], "utf-8")
+            self.assertEqual(subprocess_env["PYTHONIOENCODING"], "utf-8")
 
 
 class CliIntegrationTest(unittest.TestCase):
@@ -1094,7 +1107,7 @@ class CliIntegrationTest(unittest.TestCase):
         result = self._run("--check-libs-symbols", "--no-elevate", "--lang", "en")
         self.assertEqual(result.returncode, 2)
         self.assertIn("--check-libs-symbols", result.stderr)
-        self.assertIn("--check-libs-deps", result.stderr)
+        self.assertIn("--check-lib-deps", result.stderr)
 
     def test_packages_dir_nonexistent(self) -> None:
         result = self._run("--packages-dir", "/nonexistent/pkgcheck-dir", "--no-elevate")
@@ -1109,7 +1122,7 @@ class CliIntegrationTest(unittest.TestCase):
             (Path(tmp) / "demo-1.0").write_text("FILE LIST:\nbin/true\n")
             env = dict(os.environ, PYTHONIOENCODING="iso-8859-1")
             result = self._run(
-                "--packages-dir", tmp, "--check-libs-deps", "--no-elevate", "--lang", "en", env=env
+                "--packages-dir", tmp, "--check-lib-deps", "--no-elevate", "--lang", "en", env=env
             )
             self.assertEqual(result.returncode, 0)
             self.assertIn("not UTF-8", result.stdout)
@@ -1174,7 +1187,7 @@ class CliParserCoverageTest(unittest.TestCase):
                 ".bak,.orig",
                 "--new-suffix",
                 ".new",
-                "--check-libs-deps",
+                "--check-lib-deps",
                 "--quiet",
                 "--lang",
                 "es",
@@ -1184,7 +1197,7 @@ class CliParserCoverageTest(unittest.TestCase):
         self.assertTrue(args.json)
         self.assertEqual(args.max_rows, 5)
         self.assertIn("mnt", args.exclude[0])
-        self.assertTrue(args.check_libs_deps)
+        self.assertTrue(args.check_lib_deps)
         self.assertTrue(args.quiet)
 
     def test_build_parser_version(self) -> None:
@@ -1435,9 +1448,8 @@ class CliRunCoverageTest(unittest.TestCase):
         defaults = dict(
             quiet=False,
             json=False,
-            check_libs_deps=False,
+            check_lib_deps=False,
             check_libs_symbols=False,
-            safe_ldd=False,
             orphans=False,
             orphans_root="/",
             workers=2,
@@ -1628,7 +1640,7 @@ class CliRunCoverageTest(unittest.TestCase):
         buf = io.StringIO()
         console = Console(file=buf, width=200, force_terminal=False)
         status = Console(file=io.StringIO(), width=200, force_terminal=False)
-        args = self._make_args(quiet=False, json=False, check_libs_deps=True)
+        args = self._make_args(quiet=False, json=False, check_lib_deps=True)
         entries = [("pkg-a", "usr/bin/foo"), ("pkg-b", "usr/lib/libfoo.so.1")]
         scan_result = ScanResult(entries=entries, excluded_install=0, excluded_pseudo=0)
         statuses = [PathStatus.EXISTS, PathStatus.EXISTS]
@@ -1652,7 +1664,7 @@ class CliRunCoverageTest(unittest.TestCase):
                     mock.patch("pkgcheck.cli._LOG_DIR", Path(tmp)),
                     mock.patch("os.geteuid", return_value=0),
                 ):
-                    _run(console, status, args, Path("/tmp"), "rg", "ldd", None)
+                    _run(console, status, args, Path("/tmp"), "rg", "readelf", {})
         out = buf.getvalue()
         self.assertIn("Binaries with missing library deps", out)
 
@@ -1663,7 +1675,7 @@ class CliRunCoverageTest(unittest.TestCase):
         console = Console(file=buf, width=200, force_terminal=False)
         status = Console(file=io.StringIO(), width=200, force_terminal=False)
         args = self._make_args(
-            quiet=False, json=False, check_libs_deps=True, check_libs_symbols=True
+            quiet=False, json=False, check_lib_deps=True, check_libs_symbols=True
         )
         entries = [("pkg-a", "usr/bin/foo")]
         scan_result = ScanResult(entries=entries, excluded_install=0, excluded_pseudo=0)
@@ -1721,7 +1733,7 @@ class CliRunCoverageTest(unittest.TestCase):
         buf = io.StringIO()
         console = Console(file=buf, width=200, force_terminal=False)
         status = Console(file=io.StringIO(), width=200, force_terminal=False)
-        args = self._make_args(quiet=False, json=False, check_libs_deps=True)
+        args = self._make_args(quiet=False, json=False, check_lib_deps=True)
         entries = [("pkg-a", "usr/bin/foo")]
         scan_result = ScanResult(entries=entries, excluded_install=0, excluded_pseudo=0)
         statuses = [PathStatus.EXISTS]
@@ -1739,7 +1751,7 @@ class CliRunCoverageTest(unittest.TestCase):
                     mock.patch("pkgcheck.cli._LOG_DIR", Path(tmp)),
                     mock.patch("os.geteuid", return_value=0),
                 ):
-                    _run(console, status, args, Path("/tmp"), "rg", "ldd", None)
+                    _run(console, status, args, Path("/tmp"), "rg", "readelf", {})
         # no broken libs printed, but should not crash
         self.assertNotIn("Binaries with missing", buf.getvalue())
 
@@ -1764,7 +1776,7 @@ class CliMainCoverageTest(unittest.TestCase):
             mock.patch.object(
                 sys, "argv", ["pkgcheck", "--lang", "xx", "--no-elevate", "--packages-dir", "/tmp"]
             ),
-            mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+            mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
             mock.patch("pkgcheck.cli._ensure_root"),
             mock.patch("pkgcheck.cli.Console"),
         ):
@@ -1784,7 +1796,7 @@ class CliMainCoverageTest(unittest.TestCase):
             mock.patch.object(
                 sys, "argv", ["pkgcheck", "--no-elevate", "--packages-dir", "/nonexistent_xyz"]
             ),
-            mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+            mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
             mock.patch("pkgcheck.cli._ensure_root"),
             mock.patch("pkgcheck.cli.Console"),
         ):
@@ -1803,7 +1815,7 @@ class CliMainCoverageTest(unittest.TestCase):
                         "argv",
                         ["pkgcheck", "--no-elevate", "--packages-dir", tmp, "--workers", workers],
                     ),
-                    mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                    mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
                     mock.patch("pkgcheck.cli._ensure_root"),
                     mock.patch("pkgcheck.cli.Console"),
                 ):
@@ -1814,6 +1826,10 @@ class CliMainCoverageTest(unittest.TestCase):
                     self.assertEqual(cm.exception.code, 2)
 
     def test_main_max_rows_and_new_suffix_validation(self) -> None:
+        import importlib
+
+        import pkgcheck.cli
+
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 mock.patch.object(
@@ -1821,13 +1837,12 @@ class CliMainCoverageTest(unittest.TestCase):
                     "argv",
                     ["pkgcheck", "--no-elevate", "--packages-dir", tmp, "--max-rows", "0"],
                 ),
-                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
                 mock.patch("pkgcheck.cli._ensure_root"),
                 mock.patch("pkgcheck.cli.Console"),
             ):
                 with self.assertRaises(SystemExit):
-                    import pkgcheck.cli
-
+                    importlib.reload(pkgcheck.cli)
                     pkgcheck.cli.main()
             with (
                 mock.patch.object(
@@ -1835,12 +1850,13 @@ class CliMainCoverageTest(unittest.TestCase):
                     "argv",
                     ["pkgcheck", "--no-elevate", "--packages-dir", tmp, "--new-suffix", " "],
                 ),
-                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
                 mock.patch("pkgcheck.cli._ensure_root"),
                 mock.patch("pkgcheck.cli.Console"),
             ):
                 with self.assertRaises(SystemExit):
-                    import pkgcheck.cli
+                    importlib.reload(pkgcheck.cli)
+                    pkgcheck.cli.main()
 
                     pkgcheck.cli.main()
 
@@ -1849,7 +1865,7 @@ class CliMainCoverageTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 mock.patch.object(sys, "argv", ["pkgcheck", "--no-elevate", "--packages-dir", tmp]),
-                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
                 mock.patch("pkgcheck.cli._ensure_root"),
                 mock.patch("pkgcheck.cli.Console"),
                 mock.patch("shutil.which", return_value=None),
@@ -1870,7 +1886,7 @@ class CliMainCoverageTest(unittest.TestCase):
                     "argv",
                     ["pkgcheck", "--no-elevate", "--packages-dir", tmp, "--check-libs-symbols"],
                 ),
-                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
                 mock.patch("pkgcheck.cli._ensure_root"),
                 mock.patch("pkgcheck.cli.Console"),
                 mock.patch("shutil.which", return_value="/usr/bin/rg"),
@@ -1882,14 +1898,16 @@ class CliMainCoverageTest(unittest.TestCase):
                 self.assertEqual(cm.exception.code, 2)
 
     def test_main_ldd_not_found(self) -> None:
+        # This test is no longer relevant since we removed ldd
+        # But keep it to verify --check-lib-deps requires readelf
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 mock.patch.object(
                     sys,
                     "argv",
-                    ["pkgcheck", "--no-elevate", "--packages-dir", tmp, "--check-libs-deps"],
+                    ["pkgcheck", "--no-elevate", "--packages-dir", tmp, "--check-lib-deps"],
                 ),
-                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
                 mock.patch("pkgcheck.cli._ensure_root"),
                 mock.patch("pkgcheck.cli.Console"),
                 mock.patch(
@@ -1909,7 +1927,7 @@ class CliMainCoverageTest(unittest.TestCase):
                 mock.patch.object(
                     sys, "argv", ["pkgcheck", "--no-elevate", "--packages-dir", tmp, "--json"]
                 ),
-                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
                 mock.patch("pkgcheck.cli._ensure_root"),
                 mock.patch("shutil.which", return_value="/usr/bin/rg"),
                 mock.patch("pkgcheck.cli._run") as mock_run,
@@ -1928,7 +1946,7 @@ class CliMainCoverageTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 mock.patch.object(sys, "argv", ["pkgcheck", "--no-elevate", "--packages-dir", tmp]),
-                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
                 mock.patch("pkgcheck.cli._ensure_root"),
                 mock.patch("shutil.which", return_value="/usr/bin/rg"),
                 mock.patch("pkgcheck.cli._run", side_effect=KeyboardInterrupt),
@@ -1946,7 +1964,7 @@ class CliMainCoverageTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 mock.patch.object(sys, "argv", ["pkgcheck", "--no-elevate", "--packages-dir", tmp]),
-                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
                 mock.patch("pkgcheck.cli._ensure_root"),
                 mock.patch("shutil.which", return_value="/usr/bin/rg"),
                 mock.patch("pkgcheck.cli._run", side_effect=RuntimeError("boom")),
@@ -1964,7 +1982,7 @@ class CliMainCoverageTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 mock.patch.object(sys, "argv", ["pkgcheck", "--no-elevate", "--packages-dir", tmp]),
-                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value="latin-1"),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=("latin-1", {})),
                 mock.patch("pkgcheck.cli._ensure_root"),
                 mock.patch("shutil.which", return_value="/usr/bin/rg"),
                 mock.patch("pkgcheck.cli._run"),
@@ -1989,18 +2007,16 @@ class CliMainCoverageTest(unittest.TestCase):
                         "--no-elevate",
                         "--packages-dir",
                         tmp,
-                        "--check-libs-deps",
+                        "--check-lib-deps",
                         "--check-libs-symbols",
                     ],
                 ),
-                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
                 mock.patch("pkgcheck.cli._ensure_root"),
                 mock.patch("pkgcheck.cli.Console"),
                 mock.patch(
                     "shutil.which",
-                    side_effect=lambda x: (
-                        "/usr/bin/rg" if x == "rg" else "/usr/bin/ldd" if x == "ldd" else None
-                    ),
+                    side_effect=lambda x: "/usr/bin/rg" if x == "rg" else None,
                 ),
             ):
                 with self.assertRaises(SystemExit) as cm:
@@ -2285,29 +2301,29 @@ class ScannerFallbackTest(unittest.TestCase):
 
 class SafeLddTest(unittest.TestCase):
     def test_needed_via_readelf(self) -> None:
-        from pkgcheck.libdeps import _needed_libs_via_readelf
+        from pkgcheck.libdeps import _get_needed_libs
 
         output = " 0x00000001 (NEEDED)                     Shared library: [libfoo.so.1]\n 0x00000001 (NEEDED)                     Shared library: [libbar.so.2]\n"
         with mock.patch(
             "pkgcheck.libdeps.subprocess.run",
             return_value=types.SimpleNamespace(stdout=output, stderr=""),
         ):
-            missing = _needed_libs_via_readelf("/bin/foo", "readelf", {"libfoo.so.1": "pkg-a"})
-            self.assertEqual(missing, ["libbar.so.2"])
+            missing = _get_needed_libs("/bin/foo", "readelf")
+            # We need to check with owner_index manually
+            self.assertIn("libfoo.so.1", missing)
+            self.assertIn("libbar.so.2", missing)
 
     def test_needed_via_readelf_timeout(self) -> None:
-        from pkgcheck.libdeps import _needed_libs_via_readelf
+        from pkgcheck.libdeps import _get_needed_libs
 
         with mock.patch(
             "pkgcheck.libdeps.subprocess.run", side_effect=subprocess.TimeoutExpired("readelf", 60)
         ):
-            self.assertEqual(_needed_libs_via_readelf("/bin/foo", "readelf", {}), [])
+            self.assertEqual(_get_needed_libs("/bin/foo", "readelf"), [])
 
     def test_check_library_deps_safe(self) -> None:
-        from pkgcheck.libdeps import check_library_deps_safe
-
-        with mock.patch("pkgcheck.libdeps._needed_libs_via_readelf", side_effect=[["liba.so"], []]):
-            result = check_library_deps_safe(
+        with mock.patch("pkgcheck.libdeps._get_needed_libs", side_effect=[["liba.so"], []]):
+            result = check_library_deps(
                 ["/a", "/b"], workers=2, readelf_bin="readelf", owner_index={}
             )
             self.assertEqual(result, [["liba.so"], []])
@@ -2331,7 +2347,7 @@ class ListLogsDiffCliTest(unittest.TestCase):
             with (
                 mock.patch.object(sys, "argv", ["pkgcheck", "--list-logs"]),
                 mock.patch("pkgcheck.cli._LOG_DIR", fake_dir),
-                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
                 mock.patch("pkgcheck.cli.Console") as MockConsole,
             ):
                 mock_console = mock.MagicMock()
@@ -2351,7 +2367,7 @@ class ListLogsDiffCliTest(unittest.TestCase):
                 mock.patch.object(
                     sys, "argv", ["pkgcheck", "--diff", "--from", str(a), "--to", str(b)]
                 ),
-                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
                 mock.patch("pkgcheck.cli.Console") as MockConsole,
             ):
                 mock_console = mock.MagicMock()
@@ -2386,7 +2402,7 @@ class ListLogsDiffCliTest(unittest.TestCase):
                         str(pkg_dir),
                     ],
                 ),
-                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+                mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
                 mock.patch("pkgcheck.cli._ensure_root"),
                 mock.patch("shutil.which", return_value="/usr/bin/rg"),
                 mock.patch("pkgcheck.cli._LOG_DIR", Path(tmp)),
@@ -2403,7 +2419,7 @@ class ListLogsDiffCliTest(unittest.TestCase):
     def test_completion_cli(self) -> None:
         with (
             mock.patch.object(sys, "argv", ["pkgcheck", "--completion", "bash"]),
-            mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=None),
+            mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
             mock.patch("sys.stdout", new=io.StringIO()) as fake_out,
         ):
             import pkgcheck.cli

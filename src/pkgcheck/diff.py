@@ -20,7 +20,10 @@ class LogEntry:
 
 def list_logs(log_dir: Path) -> list[LogEntry]:
     """Returns pkgcheck logs in `log_dir` sorted by mtime (newest first)."""
-    if not log_dir.is_dir():
+    try:
+        if not log_dir.is_dir():
+            return []
+    except OSError:
         return []
     entries: list[LogEntry] = []
     for p in log_dir.glob("pkgcheck-*.log"):

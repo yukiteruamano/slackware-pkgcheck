@@ -8,7 +8,7 @@ from pathlib import Path
 from pkgcheck.scanner import _PSEUDO_PREFIXES
 
 # Additional prefixes that are never considered orphans (even if not in package DB).
-# Reuses scanner pseudo plus home (often noisy) optionally.
+# Reuses scanner pseudo prefixes plus home (often noisy) and var/log/pkgcheck/, var/log/setup/
 _ORPHAN_EXCLUDE = (
     *_PSEUDO_PREFIXES,
     "var/cache/",
@@ -27,8 +27,12 @@ _ORPHAN_EXCLUDE = (
 
 def _is_orphan_excluded(rel: str, extra_exclude: tuple[str, ...] = ()) -> bool:
     """Returns whether `rel` (without leading `/`) should be ignored for orphans."""
-    # var/log/packages is the DB itself, never orphan
+    # var/log/packages is the DB itself and pkgcheck/setup logs are not orphans
     if rel.startswith("var/log/packages/") or rel == "var/log/packages":
+        return True
+    if rel.startswith("var/log/pkgcheck/") or rel == "var/log/pkgcheck":
+        return True
+    if rel.startswith("var/log/setup/") or rel == "var/log/setup":
         return True
     prefixes = (*_ORPHAN_EXCLUDE, *extra_exclude)
     return rel.startswith(prefixes)
@@ -76,8 +80,10 @@ def find_orphans(
                 continue
             if rel in owned_rels:
                 continue
-            # Build display path (chroot-aware) and normalize
-            display_path = os.path.normpath(str(root / rel) if root_str != "/" else f"/{rel}")
+            # Build display path (chroot-aware) without resolving symlinks
+            display_path = f"/{rel}" if root_str == "/" else str(Path(root_str) / rel)
+            # Lexically normalize without following symlinks
+            display_path = os.path.normpath(display_path)
             if display_path not in orphans:
                 orphans.append(display_path)
     orphans.sort()

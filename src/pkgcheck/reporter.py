@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -38,7 +39,7 @@ class BrokenBinary:
 type BrokenLibsIndex = dict[str, list[BrokenBinary]]
 type UndefinedSymbolsIndex = dict[str, dict[str, list[str]]]
 
-_LOG_TIME_FORMAT = "%d-%m-%Y-%H-%M-%S"
+_LOG_TIME_FORMAT = "%d-%m-%Y-%H-%M-%S-%f"
 
 _BANNER_LEN = 12
 
@@ -49,7 +50,8 @@ def report_path(log_dir: Path, when: datetime, fmt: str) -> Path:
 
 
 def unique_report_path(log_dir: Path, when: datetime, fmt: str) -> Path:
-    """Returns a log path that does not yet exist, appending a ``-N`` suffix on collision."""
+    """Returns a log path that does not yet exist, using microsecond precision and UUID."""
+    # Use microsecond precision for the base path
     path = report_path(log_dir, when, fmt)
     # Fast path: no collision
     try:
@@ -58,14 +60,9 @@ def unique_report_path(log_dir: Path, when: datetime, fmt: str) -> Path:
     except OSError:
         # If we cannot stat, return original and let write_report handle error
         return path
-    for index in range(1, 10_000):
-        candidate = log_dir / f"pkgcheck-{when:{_LOG_TIME_FORMAT}}-{index}.{fmt}"
-        try:
-            if not candidate.exists():
-                return candidate
-        except OSError:
-            return candidate
-    raise OSError(t("too many pkgcheck logs in {dir} for the same second").format(dir=log_dir))
+
+    # Collision - use UUID suffix for guaranteed uniqueness
+    return log_dir / f"pkgcheck-{when:{_LOG_TIME_FORMAT}}-{uuid.uuid4().hex[:8]}.{fmt}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,8 +174,8 @@ def print_breakdown(
             tree.add(t("... and {remaining} more packages").format(remaining=remaining))
             break
         branch = tree.add(f"[bold cyan]{package}[/bold cyan] ({len(paths)})")
-        # Limit paths per package to avoid OOM (show first max_rows*10 or 1000)
-        limit = 1000
+        # Limit paths per package to respect max_rows (show max_rows files per package)
+        limit = max_rows if max_rows is not None else 1000
         for p in paths[:limit]:
             branch.add(p)
         if len(paths) > limit:

@@ -57,9 +57,16 @@ def check_path(
       ``NEW_PENDING``.
     - If none of the above exist but a backup variant (``.bak``, ``.orig``) does, it is
       reported as ``BACKUP`` instead of ``MISSING``.
+    - If `path` ends with `new_suffix` AND a backup variant exists (e.g., foo.conf.new.bak),
+      report as ``NEW_PENDING`` (new config takes precedence over backup).
     """
     if not new_suffix:
         new_suffix = _DEFAULT_NEW_SUFFIX
+
+    is_new_variant = path.endswith(new_suffix)
+    base_path = path[: -len(new_suffix)] if is_new_variant else path
+
+    # First, check if the path itself exists
     try:
         os.lstat(path)
     except FileNotFoundError:
@@ -69,26 +76,41 @@ def check_path(
     except OSError:
         return PathStatus.ERROR
     else:
-        if path.endswith(new_suffix):
+        if is_new_variant:
             return PathStatus.NEW_PENDING
         return PathStatus.EXISTS
 
+    # Path doesn't exist. Check for .new variant (for base paths) or base (for .new paths)
     try:
-        if _lexists(path + new_suffix):
-            return PathStatus.NEW_PENDING
+        if is_new_variant:
+            # Package recorded foo.conf.new - check if base foo.conf exists (renamed)
+            if _lexists(base_path):
+                return PathStatus.EXISTS
+        else:
+            # Package recorded foo.conf - check if foo.conf.new exists (pending review)
+            if _lexists(path + new_suffix):
+                return PathStatus.NEW_PENDING
     except PermissionError:
         return PathStatus.NO_ACCESS
-    try:
-        if path.endswith(new_suffix) and _lexists(path[: -len(new_suffix)]):
-            return PathStatus.EXISTS
-    except PermissionError:
-        return PathStatus.NO_ACCESS
-    for suffix in backup_suffixes:
+
+    # Check for backup variants
+    # For .new paths, check .new.bak first, then base.bak; for base paths, check base.bak
+    candidates: list[str] = []
+    if is_new_variant:
+        for suffix in backup_suffixes:
+            candidates.append(path + suffix)
+        for suffix in backup_suffixes:
+            candidates.append(base_path + suffix)
+    else:
+        for suffix in backup_suffixes:
+            candidates.append(base_path + suffix)
+    for cand in candidates:
         try:
-            if _lexists(path + suffix):
+            if _lexists(cand):
                 return PathStatus.BACKUP
         except PermissionError:
             return PathStatus.NO_ACCESS
+
     return PathStatus.MISSING
 
 
@@ -118,15 +140,17 @@ def _is_elf_candidate(st_mode: int, path: str) -> bool:
 def _is_elf(path: str) -> bool:
     """Returns whether `path` is a regular ELF file (checks the 4-byte magic header).
 
-    Safe against special files: follows symbolic links, requires a regular file
-    (``S_ISREG``) so FIFOs/sockets/devices are never opened (which would block), and
-    opens with ``O_NONBLOCK`` as a belt-and-suspenders against a file being swapped
-    for a FIFO between the stat and the open (TOCTOU).
+    Follows symbolic links to their final target. Uses ``O_NONBLOCK`` so FIFOs/
+    sockets/devices never block, and verifies ``S_ISREG`` after open to avoid
+    TOCTOU races (check-then-open replaced by open-then-check).
     """
     try:
+        # Open without O_NOFOLLOW so we follow symlinks to the real file;
+        # use O_NONBLOCK to avoid blocking on FIFOs.
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError:
         return False
+
     try:
         try:
             st = os.fstat(fd)
@@ -136,18 +160,22 @@ def _is_elf(path: str) -> bool:
             except OSError:
                 pass
             return False
+
+        # Must be a regular file (symlink already resolved by open)
         if not stat.S_ISREG(st.st_mode):
             try:
                 os.close(fd)
             except OSError:
                 pass
             return False
+
         if not _is_elf_candidate(st.st_mode, path):
             try:
                 os.close(fd)
             except OSError:
                 pass
             return False
+
         try:
             with os.fdopen(fd, "rb", closefd=True) as handle:
                 return handle.read(4) == _ELF_MAGIC
@@ -159,6 +187,11 @@ def _is_elf(path: str) -> bool:
         except OSError:
             pass
         return False
+
+
+def _is_elf_target(path: str) -> bool:
+    """Check if a path is an ELF file (legacy alias, follows symlinks)."""
+    return _is_elf(path)
 
 
 def check_path_and_elf(
@@ -193,7 +226,7 @@ def _run_workers(
     paths = list(paths)
     total = len(paths)
     results: list[object] = [None] * total
-    window = min(max(workers * 2, 64), 1024)
+    window = min(max(workers * 2, 64), 256)
     in_flight: dict[Future[Any], int] = {}
     last_update = 0.0
     done = 0

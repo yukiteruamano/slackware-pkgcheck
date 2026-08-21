@@ -32,7 +32,6 @@ from pkgcheck.i18n import ALL_LANGUAGES, detect_language, is_supported, set_lang
 from pkgcheck.libdeps import (
     build_library_owner_index,
     check_library_deps,
-    check_library_deps_safe,
     check_undefined_symbols,
     collect_defined_symbols,
     find_missing_owner,
@@ -57,6 +56,15 @@ from pkgcheck.reporter import (
     write_report,
 )
 from pkgcheck.scanner import _PSEUDO_PREFIXES, ScanResult, scan_package_files
+from pkgcheck.validate import (
+    ValidationError,
+    validate_backup_suffixes,
+    validate_binary_path,
+    validate_exclude_prefix,
+    validate_new_suffix,
+    validate_orphans_root,
+    validate_packages_dir,
+)
 from pkgcheck.verifier import (
     _DEFAULT_BACKUP_SUFFIXES,
     _DEFAULT_NEW_SUFFIX,
@@ -83,16 +91,15 @@ def _is_utf8(encoding: str | None) -> bool:
     return encoding.lower().replace("_", "").replace("-", "") == "utf8"
 
 
-def _ensure_utf8_environment() -> str | None:
+def _ensure_utf8_environment() -> tuple[str | None, dict[str, str]]:
     """Detects a broken (non-UTF-8) terminal encoding and forces the UTF-8 fallback.
 
     Called before any output so pkgcheck never crashes writing to the console
     (e.g. the rich spinner uses Braille characters that latin-1 cannot encode).
 
-    Reconfigures stdout/stderr to UTF-8 and, when something was broken, applies the
-    documented fallback ``LANG=en_US`` / ``UTF-8`` (also inherited by subprocesses
-    and by the ``sudo`` re-exec). Returns the previous encoding so the caller can
+    Reconfigures stdout/stderr to UTF-8 and returns the previous encoding so the caller can
     warn the user, or ``None`` when the environment was already correct.
+    Also returns an environment dict with UTF-8 fallback for subprocesses.
     """
     previous: str | None = None
     for stream in (sys.stdout, sys.stderr):
@@ -103,11 +110,16 @@ def _ensure_utf8_environment() -> str | None:
                 cast_any = getattr(stream, "reconfigure", None)
                 if callable(cast_any):
                     cast_any(encoding="utf-8", errors="replace")
+
+    # Return subprocess env with UTF-8 fallback (without modifying global os.environ)
+    subprocess_env = {}
     if previous is not None:
-        os.environ["PYTHONIOENCODING"] = "utf-8"
-        os.environ["LC_ALL"] = "en_US.UTF-8"
-        os.environ["LANG"] = "en_US.UTF-8"
-    return previous
+        subprocess_env = {
+            "PYTHONIOENCODING": "utf-8",
+            "LC_ALL": "en_US.UTF-8",
+            "LANG": "en_US.UTF-8",
+        }
+    return previous, subprocess_env
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -172,11 +184,11 @@ def _build_parser() -> argparse.ArgumentParser:
         ).format(suffix=_DEFAULT_NEW_SUFFIX),
     )
     parser.add_argument(
-        "--check-libs-deps",
+        "--check-lib-deps",
         action="store_true",
         help=t(
             "Also checks that every installed ELF binary and shared library has all "
-            "its dynamic library dependencies present (revdep-rebuild style)."
+            "its dynamic library dependencies present using readelf (safe, no execution)."
         ),
     )
     parser.add_argument(
@@ -184,7 +196,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=t(
             "Also checks installed binaries for undefined dynamic symbols not provided "
-            "by any installed library (requires --check-libs-deps; may report false "
+            "by any installed library (requires --check-lib-deps; may report false "
             "positives)."
         ),
     )
@@ -237,11 +249,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help=t("Second log for --diff (path or 'latest')."),
     )
     parser.add_argument(
-        "--safe-ldd",
-        action="store_true",
-        help=t("Use safe readelf -d NEEDED instead of ldd (no execution)."),
-    )
-    parser.add_argument(
         "--completion",
         choices=["bash", "zsh", "fish"],
         default=None,
@@ -277,9 +284,8 @@ def _completion_script(shell: str) -> str:
         "--exclude",
         "--backup-suffixes",
         "--new-suffix",
-        "--check-libs-deps",
+        "--check-lib-deps",
         "--check-libs-symbols",
-        "--safe-ldd",
         "--quiet",
         "--lang",
         "--elevate",
@@ -342,7 +348,7 @@ def _resolve_log_path(value: str | None, log_dir: Path) -> Path | None:
 
 def main() -> None:
     """Main entry point: validates the environment and starts the analysis."""
-    previous_encoding = _ensure_utf8_environment()
+    previous_encoding, subprocess_env = _ensure_utf8_environment()
 
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--lang")
@@ -418,9 +424,17 @@ def main() -> None:
     if args.lang is not None and not is_supported(args.lang):
         parser.error(t("unsupported language: {lang}").format(lang=args.lang))
 
-    packages_dir = Path(args.packages_dir).expanduser().resolve()
-    if not packages_dir.is_dir():
-        parser.error(t("the packages directory does not exist: {path}").format(path=packages_dir))
+    # Validate and normalize inputs using defense-in-depth validators
+    try:
+        expanded_packages = str(Path(args.packages_dir).expanduser())
+        packages_dir_str = validate_packages_dir(expanded_packages)
+        packages_dir = Path(packages_dir_str).resolve()
+        if not packages_dir.is_dir():
+            parser.error(
+                t("the packages directory does not exist: {path}").format(path=packages_dir)
+            )
+    except ValidationError as exc:
+        parser.error(t("invalid packages directory: {exc}").format(exc=exc))
 
     if args.workers < 1:
         parser.error(t("--workers must be a positive integer"))
@@ -431,8 +445,15 @@ def main() -> None:
     if args.max_rows is not None and args.max_rows < 1:
         parser.error(t("--max-rows must be a positive integer"))
 
-    if not args.new_suffix.strip():
-        parser.error(t("--new-suffix cannot be empty"))
+    try:
+        validate_new_suffix(args.new_suffix)
+    except ValidationError as exc:
+        parser.error(t("invalid new-suffix: {exc}").format(exc=exc))
+
+    try:
+        validate_backup_suffixes(args.backup_suffixes)
+    except ValidationError as exc:
+        parser.error(t("invalid backup-suffixes: {exc}").format(exc=exc))
 
     console = Console()
     status_console = Console(stderr=True)
@@ -452,32 +473,56 @@ def main() -> None:
         (status_console if args.json else console).print(
             t("[yellow]ripgrep (rg) not found, falling back to Python scan (slower).[/yellow]")
         )
+    else:
+        try:
+            rg_bin = validate_binary_path(rg_bin)
+        except ValidationError as exc:
+            parser.error(t("invalid rg binary path: {exc}").format(exc=exc))
 
-    if args.check_libs_symbols and not args.check_libs_deps:
-        parser.error(t("--check-libs-symbols requires --check-libs-deps"))
+    if args.check_libs_symbols and not args.check_lib_deps:
+        parser.error(t("--check-libs-symbols requires --check-lib-deps"))
 
-    if args.safe_ldd and not args.check_libs_deps:
-        parser.error(t("--safe-ldd requires --check-libs-deps"))
+    # Validate --exclude prefixes eagerly so user gets feedback
+    for value in args.exclude:
+        for part in value.split(","):
+            cleaned = part.strip().lstrip("/")
+            if not cleaned:
+                continue
+            if not cleaned.endswith("/"):
+                cleaned += "/"
+            try:
+                validate_exclude_prefix(cleaned)
+            except ValidationError as exc:
+                parser.error(
+                    t("invalid --exclude prefix '{prefix}': {exc}").format(prefix=part, exc=exc)
+                )
 
     if args.orphans:
-        orphans_root = Path(args.orphans_root).expanduser().resolve()
+        try:
+            expanded_orphans = str(Path(args.orphans_root).expanduser())
+            orphans_root_str = validate_orphans_root(expanded_orphans)
+            orphans_root = Path(orphans_root_str).resolve()
+        except ValidationError as exc:
+            parser.error(t("invalid orphans root: {exc}").format(exc=exc))
         if not orphans_root.is_dir():
             parser.error(t("orphans root does not exist: {path}").format(path=orphans_root))
 
-    ldd_bin = shutil.which("ldd") if args.check_libs_deps and not args.safe_ldd else None
-    if args.check_libs_deps and not args.safe_ldd and ldd_bin is None:
-        parser.error(t("ldd was not found on the system; it is required for --check-libs-deps"))
-
-    readelf_bin = shutil.which("readelf") if (args.check_libs_symbols or args.safe_ldd) else None
-    if (args.check_libs_symbols or args.safe_ldd) and readelf_bin is None:
-        parser.error(
-            t(
-                "readelf was not found on the system; it is required for --check-libs-symbols/--safe-ldd"
+    readelf_bin = None
+    if args.check_lib_deps or args.check_libs_symbols:
+        readelf_bin = shutil.which("readelf")
+        if readelf_bin is None:
+            parser.error(
+                t(
+                    "readelf was not found on the system; it is required for --check-lib-deps/--check-libs-symbols"
+                )
             )
-        )
+        try:
+            readelf_bin = validate_binary_path(readelf_bin)
+        except ValidationError as exc:
+            parser.error(t("invalid readelf binary path: {exc}").format(exc=exc))
 
     try:
-        _run(console, status_console, args, packages_dir, rg_bin, ldd_bin, readelf_bin)
+        _run(console, status_console, args, packages_dir, rg_bin, readelf_bin, subprocess_env)
     except KeyboardInterrupt:
         console.print(t("\n[red]Interrupted by the user.[/red]"))
         raise SystemExit(130) from None
@@ -524,16 +569,22 @@ def _exec_with_sudo() -> None:
     sudo_bin = shutil.which("sudo")
     if sudo_bin is None:
         raise RuntimeError(t("sudo was not found on the system; run pkgcheck directly as root"))
+
     script = str(Path(sys.argv[0]).resolve())
     if Path(script).name == "__main__.py":
         cmd = [sys.executable, "-m", "pkgcheck", *sys.argv[1:]]
     else:
         cmd = [script, *sys.argv[1:]]
+
     # Preserve UTF-8 fallback env across sudo (sudo env_reset may drop it)
-    os.execvp(
-        sudo_bin,
-        [sudo_bin, "--preserve-env=PYTHONIOENCODING,LC_ALL,LC_MESSAGES,LANG", "--", *cmd],
-    )
+    try:
+        os.execvp(
+            sudo_bin,
+            [sudo_bin, "--preserve-env=PYTHONIOENCODING,LC_ALL,LC_MESSAGES,LANG", "--", *cmd],
+        )
+    except OSError as exc:
+        # execvp only returns on error
+        raise RuntimeError(t("failed to execute sudo: {exc}").format(exc=exc)) from exc
 
 
 def _pseudo_prefixes(args: argparse.Namespace) -> tuple[str, ...]:
@@ -545,20 +596,31 @@ def _pseudo_prefixes(args: argparse.Namespace) -> tuple[str, ...]:
             if part and not part.endswith("/"):
                 part += "/"
             if part:
-                extra.append(part)
+                with contextlib.suppress(ValidationError):
+                    extra.append(validate_exclude_prefix(part))
     return _PSEUDO_PREFIXES + tuple(extra)
 
 
 def _backup_suffixes(args: argparse.Namespace) -> tuple[str, ...]:
     """Normalizes the --backup-suffixes list."""
     raw: str = cast(str, args.backup_suffixes)
-    return tuple(s.strip() for s in raw.split(",") if s.strip())
+    try:
+        return validate_backup_suffixes(raw)
+    except ValidationError:
+        # If explicitly empty (only whitespace/commas), return empty tuple
+        if not raw.strip().strip(","):
+            return ()
+        # Fallback to defaults on validation error
+        return _DEFAULT_BACKUP_SUFFIXES
 
 
 def _new_suffix(args: argparse.Namespace) -> str:
     """Normalizes the --new-suffix value."""
     raw: str = cast(str, args.new_suffix)
-    return raw.strip()
+    try:
+        return validate_new_suffix(raw)
+    except ValidationError:
+        return _DEFAULT_NEW_SUFFIX
 
 
 def _write_auto_log(
@@ -614,8 +676,8 @@ def _run(
     args: argparse.Namespace,
     packages_dir: Path,
     rg_bin: str | None,
-    ldd_bin: str | None,
     readelf_bin: str | None,
+    subprocess_env: dict[str, str],
 ) -> None:
     started = time.monotonic()
     when = datetime.now()
@@ -627,6 +689,7 @@ def _run(
         packages_dir,
         rg_bin,
         pseudo_prefixes=_pseudo_prefixes(args),
+        subprocess_env=subprocess_env,
     )
     entries = scan_result.entries
     if not entries:
@@ -645,7 +708,7 @@ def _run(
     )
     with Progress(*progress_columns, console=status, disable=args.quiet or args.json) as progress:
         verify_task = progress.add_task(t("Verifying existence of files..."), total=len(entries))
-        if args.check_libs_deps:
+        if args.check_lib_deps:
             statuses, elf_flags = verify_paths_with_elf(
                 abs_paths,
                 args.workers,
@@ -696,12 +759,9 @@ def _run(
         if not args.quiet:
             status.print(t("Scanning for orphan files in {path}...").format(path=orphans_root))
         orphans = find_orphans(owned_set, root=orphans_root, extra_exclude=extra_for_orphans)
-    if args.check_libs_deps:
+    if args.check_lib_deps:
         assert elf_flags is not None
-        if args.safe_ldd:
-            assert readelf_bin is not None
-        else:
-            assert ldd_bin is not None
+        assert readelf_bin is not None
         elf_entries = [
             (package, rel)
             for (package, rel), is_elf in zip(entries, elf_flags, strict=True)
@@ -715,25 +775,16 @@ def _run(
                 *progress_columns, console=status, disable=args.quiet or args.json
             ) as progress:
                 deps_task = progress.add_task(
-                    t("Checking library dependencies (ldd)..."), total=len(elf_paths)
+                    t("Checking library dependencies (readelf)..."), total=len(elf_paths)
                 )
-                if args.safe_ldd:
-                    assert readelf_bin is not None
-                    missing_per_path = check_library_deps_safe(
-                        elf_paths,
-                        args.workers,
-                        readelf_bin,
-                        owner_index,
-                        on_progress=lambda done: progress.update(deps_task, completed=done),
-                    )
-                else:
-                    assert ldd_bin is not None
-                    missing_per_path = check_library_deps(
-                        elf_paths,
-                        args.workers,
-                        ldd_bin,
-                        on_progress=lambda done: progress.update(deps_task, completed=done),
-                    )
+                missing_per_path = check_library_deps(
+                    elf_paths,
+                    args.workers,
+                    readelf_bin,
+                    owner_index,
+                    on_progress=lambda done: progress.update(deps_task, completed=done),
+                    extra_env=subprocess_env,
+                )
 
             for (package, rel), missing in zip(elf_entries, missing_per_path, strict=True):
                 if not missing:
@@ -758,6 +809,7 @@ def _run(
                         args.workers,
                         readelf_bin,
                         on_progress=lambda done: progress.update(sym_task, completed=done),
+                        extra_env=subprocess_env,
                     )
                 with Progress(
                     *progress_columns, console=status, disable=args.quiet or args.json
@@ -771,6 +823,7 @@ def _run(
                         args.workers,
                         readelf_bin,
                         on_progress=lambda done: progress.update(undef_task, completed=done),
+                        extra_env=subprocess_env,
                     )
                 for (package, rel), symbols in zip(elf_entries, undefined_by_path, strict=True):
                     if not symbols:
