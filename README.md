@@ -19,7 +19,6 @@ in `/var/log/packages/` really exist on the system.
 - Excludes install scripts (`install/`) and pseudo-filesystems (`dev/`, `sys/`, `proc/`, `run/`, `tmp/`, `var/tmp`, `var/cache`, `var/spool`, `var/log`, `mnt`, `media`, …) with `var/log/packages` exception.
 - Reports files with **verification errors** too (JSON `files_errors` / `ERRORS` log section).
 - Finds **orphan** files not owned by any package (`--orphans`) and diffs two runs (`--diff` with `--list-logs`).
-- Safe `readelf -d NEEDED` mode (`--safe-ldd`) as alternative to `ldd` (no execution).
 - Shell completion for bash/zsh/fish (`--completion`).
 - Live progress and report with **rich**; summary + breakdown per package.
 - Automatic log in `/var/log/pkgcheck/pkgcheck-<date>.log` (`.json` with `--json`).
@@ -49,8 +48,7 @@ uv run pkgcheck --no-elevate --json           # without root: only prints the JS
 uv run pkgcheck --workers 16                  # adjusts the parallelism
 uv run pkgcheck --packages-dir /mnt/root/var/log/packages
 sudo uv run pkgcheck --check-libs-deps        # also checks library dependencies (ldd)
-sudo uv run pkgcheck --check-libs-deps --safe-ldd  # safe readelf mode (no execution)
-sudo uv run pkgcheck --check-libs-deps --check-libs-symbols   # + undefined symbols
+sudo uv run pkgcheck --check-libs-deps --check-libs-symbols   # + undefined symbols (nm -D)
 uv run pkgcheck --orphans --orphans-root /    # lists untracked files
 uv run pkgcheck --list-logs                   # lists existing logs
 uv run pkgcheck --diff --from latest --to /var/log/pkgcheck/pkgcheck-...json --json
@@ -78,11 +76,12 @@ over the whole system is expensive.
 ### Undefined symbols (`--check-libs-symbols`)
 
 An optional, extra mode (mirrors revdep-rebuild's `-u` / `SEARCH_SYMBOLS`). After
-collecting the set of dynamic symbols exported by the installed libraries, it
-flags binaries that import symbols no installed library provides. It **requires**
-`--check-libs-deps` and the `readelf` tool, and is **prone to false positives**
-(lazy binding, `dlopen`-loaded libraries, symbol versioning). Results appear in
-the `undefined_symbols` JSON key and the `UNDEFINED SYMBOLS` log section.
+collecting the set of dynamic symbols exported by the installed libraries using
+`nm -D`, it flags binaries that import symbols no installed library provides. It
+**requires** `--check-libs-deps` and the `nm` tool (binutils), and is **prone to
+false positives** (lazy binding, `dlopen`-loaded libraries, symbol versioning).
+Results appear in the `undefined_symbols` JSON key and the `UNDEFINED SYMBOLS`
+log section.
 
 ### Root privileges
 
@@ -137,10 +136,6 @@ With `--orphans` pkgcheck also reports files present on disk but not owned by an
 
 - `--list-logs` prints a table of existing logs in `/var/log/pkgcheck/` (idx, date, fmt, size, path).
 - `--diff --from PATH --to PATH` (or `latest`/`latest-1` aliases) diffs two JSON reports (`missing`, `files_backup`, ..., `orphans`, `broken_libs`). In text mode it shows `+ added`/`- removed` per package; with `--json` it prints a JSON diff. Text logs (`.log`) are not diffable.
-
-### Safe library deps (`--safe-ldd`)
-
-`--check-libs-deps` uses `ldd` which executes the binary. With `--safe-ldd` the check uses `readelf -d NEEDED` instead (no execution) and reports a library as missing if no installed package provides it (best-effort via `owner_index`). Requires `readelf`.
 
 ### Shell completion (`--completion`)
 
@@ -206,9 +201,8 @@ are not localized: they are the stable API.
 | `--check-libs-deps`| Also checks that every installed ELF binary/library has all its dynamic  |
 |                    | library dependencies present (`ldd`; revdep-rebuild style).               |
 | `--check-libs-symbols`| Also checks installed binaries for undefined dynamic symbols not        |
-|                    | provided by any installed library (requires `--check-libs-deps`; may      |
-|                    | report false positives).                                                  |
-| `--safe-ldd`       | Use `readelf -d NEEDED` instead of `ldd` (no execution, safe mode).     |
+|                    | provided by any installed library using `nm -D` (requires `--check-libs- |
+|                    | deps`; may report false positives).                                       |
 | `--orphans`        | Also list orphan files not owned by any package.                           |
 | `--orphans-root`   | Root for `--orphans` scan (default `/`).                                   |
 | `--list-logs`      | List existing logs in `/var/log/pkgcheck` and exit.                       |

@@ -31,9 +31,9 @@ from pkgcheck.cli import (
 )
 from pkgcheck.libdeps import (
     _is_library_path,
-    _readelf_symbols,
     _undefined_symbols,
     build_library_owner_index,
+    check_libs_deps,
     check_library_deps,
     check_undefined_symbols,
     collect_defined_symbols,
@@ -448,38 +448,12 @@ class LibdepsTest(unittest.TestCase):
     def _fake_run(self, stdout: str, stderr: str = ""):
         return types.SimpleNamespace(stdout=stdout, stderr=stderr)
 
-    def test_get_needed_libs_parses_output(self) -> None:
-        from pkgcheck.libdeps import _get_needed_libs
-
-        output = (
-            " 0x00000001 (NEEDED)                     Shared library: [libfoo.so.1]\n"
-            " 0x00000001 (NEEDED)                     Shared library: [libbar.so.2]\n"
-        )
-        with mock.patch(
-            "pkgcheck.libdeps.subprocess.run",
-            return_value=self._fake_run(output),
-        ) as run:
-            missing = _get_needed_libs("/x", "readelf")
-        self.assertEqual(missing, ["libfoo.so.1", "libbar.so.2"])
-        run.assert_called_once()
-
-    def test_get_needed_libs_ignores_not_elf(self) -> None:
-        from pkgcheck.libdeps import _get_needed_libs
-
-        with mock.patch(
-            "pkgcheck.libdeps.subprocess.run",
-            return_value=self._fake_run("not an ELF file\n"),
-        ):
-            self.assertEqual(_get_needed_libs("/x", "readelf"), [])
-
     def test_check_library_deps_preserves_order_and_progress(self) -> None:
         with mock.patch(
-            "pkgcheck.libdeps._get_needed_libs", side_effect=[["liba.so"], [], ["libb.so"]]
+            "pkgcheck.libdeps._ldd_missing", side_effect=[["liba.so"], [], ["libb.so"]]
         ) as m:
             events: list[int] = []
-            result = check_library_deps(
-                ["/x", "/y", "/z"], 3, "readelf", {}, on_progress=events.append
-            )
+            result = check_library_deps(["/x", "/y", "/z"], 3, "ldd", {}, on_progress=events.append)
         self.assertEqual(result, [["liba.so"], [], ["libb.so"]])
         self.assertEqual(m.call_count, 3)
         self.assertTrue(events)
@@ -487,56 +461,22 @@ class LibdepsTest(unittest.TestCase):
 
     def test_check_undefined_symbols_returns_parallel_list(self) -> None:
         with mock.patch(
-            "pkgcheck.libdeps._undefined_symbols",
+            "pkgcheck.libdeps._get_undefined_symbols",
             side_effect=[["sym_a"], [], ["sym_b"]],
         ) as m:
             events: list[int] = []
             result = check_undefined_symbols(
-                ["/x", "/y", "/z"], {"defined"}, 3, "readelf", on_progress=events.append
+                ["/x", "/y", "/z"], {"defined"}, 3, "nm", on_progress=events.append
             )
         self.assertEqual(result, [["sym_a"], [], ["sym_b"]])
         self.assertEqual(m.call_count, 3)
         self.assertEqual(events[-1], 3)
 
-    def test_get_needed_libs_timeout_returns_empty(self) -> None:
-        from pkgcheck.libdeps import _get_needed_libs
-
-        with mock.patch(
-            "pkgcheck.libdeps.subprocess.run", side_effect=subprocess.TimeoutExpired("readelf", 60)
-        ):
-            self.assertEqual(_get_needed_libs("/x", "readelf"), [])
-
-    def test_get_needed_libs_oserror_returns_empty(self) -> None:
-        from pkgcheck.libdeps import _get_needed_libs
-
-        with mock.patch("pkgcheck.libdeps.subprocess.run", side_effect=OSError("boom")):
-            self.assertEqual(_get_needed_libs("/x", "readelf"), [])
-
-    def test_get_needed_libs_malformed_output(self) -> None:
-        from pkgcheck.libdeps import _get_needed_libs
-
-        output = (
-            "garbage line\n"
-            " 0x00000001 (NEEDED)                     Shared library: [libfoo.so.1]\n"
-            "stray text\n"
-            " 0x00000001 (NEEDED)                     Shared library: [libbar.so.2]\n"
-        )
-        with mock.patch("pkgcheck.libdeps.subprocess.run", return_value=self._fake_run(output)):
-            missing = _get_needed_libs("/x", "readelf")
-        self.assertEqual(missing, ["libfoo.so.1", "libbar.so.2"])
-
     def test_collect_defined_symbols_empty(self) -> None:
-        self.assertEqual(collect_defined_symbols([], 4, "readelf"), set())
-
-    def test_collect_defined_symbols_readelf_failure(self) -> None:
-        with mock.patch("pkgcheck.libdeps._readelf_symbols", return_value=None):
-            events: list[int] = []
-            defined = collect_defined_symbols(["/x", "/y"], 4, "readelf", on_progress=events.append)
-        self.assertEqual(defined, set())
-        self.assertEqual(events[-1], 2)
+        self.assertEqual(collect_defined_symbols([], 4, "nm"), set())
 
     def test_check_library_deps_empty(self) -> None:
-        self.assertEqual(check_library_deps([], 4, "readelf", {}), [])
+        self.assertEqual(check_library_deps([], 4, "ldd", {}), [])
 
     def test_is_library_path_variants(self) -> None:
         self.assertTrue(_is_library_path("usr/libexec/foo.so"))
@@ -544,61 +484,6 @@ class LibdepsTest(unittest.TestCase):
         self.assertFalse(_is_library_path("usr/share/doc/foo.so"))
         self.assertFalse(_is_library_path("usr/lib/foo.a"))
         self.assertFalse(_is_library_path("usr/lib/foo"))
-
-    def test_get_needed_libs_dedup(self) -> None:
-        from pkgcheck.libdeps import _get_needed_libs
-
-        output = (
-            " 0x00000001 (NEEDED)                     Shared library: [libfoo.so.1]\n"
-            " 0x00000001 (NEEDED)                     Shared library: [libfoo.so.1]\n"
-            " 0x00000001 (NEEDED)                     Shared library: [libbar.so.2]\n"
-        )
-        with mock.patch("pkgcheck.libdeps.subprocess.run", return_value=self._fake_run(output)):
-            missing = _get_needed_libs("/x", "readelf")
-        self.assertEqual(missing, ["libfoo.so.1", "libbar.so.2"])
-
-    def test_readelf_symbols_with_version(self) -> None:
-        output = (
-            "     6: 0000000000000000     0 FUNC    GLOBAL DEFAULT  UND puts@GLIBC_2.2.5\n"
-            "    13: 0000000000004a40    26 FUNC    GLOBAL DEFAULT   13 main\n"
-            "    14: 0000000000000000     0 FUNC    GLOBAL DEFAULT   12 foo@VER_1\n"
-        )
-        with mock.patch("pkgcheck.libdeps.subprocess.run", return_value=self._fake_run(output)):
-            symbols = _readelf_symbols("/x", "readelf")
-        self.assertIsNotNone(symbols)
-        assert symbols is not None
-        self.assertIn("main", symbols)
-        self.assertIn("foo@VER_1", symbols)
-        self.assertNotIn("UND", symbols)
-
-    def test_readelf_symbols_timeout_returns_none(self) -> None:
-        with mock.patch(
-            "pkgcheck.libdeps.subprocess.run", side_effect=subprocess.TimeoutExpired("readelf", 60)
-        ):
-            self.assertIsNone(_readelf_symbols("/x", "readelf"))
-
-    def test_readelf_symbols_oserror_returns_none(self) -> None:
-        with mock.patch("pkgcheck.libdeps.subprocess.run", side_effect=OSError("boom")):
-            self.assertIsNone(_readelf_symbols("/x", "readelf"))
-
-    def test_undefined_symbols_versioned(self) -> None:
-        output = (
-            "     6: 0000000000000000     0 FUNC    GLOBAL DEFAULT  UND puts@GLIBC_2.2.5\n"
-            "     7: 0000000000000000     0 FUNC    GLOBAL DEFAULT  UND missing@VER_1\n"
-        )
-        with mock.patch("pkgcheck.libdeps.subprocess.run", return_value=self._fake_run(output)):
-            undefined = _undefined_symbols("/x", {"puts@GLIBC_2.2.5"}, "readelf")
-        self.assertEqual(undefined, ["missing@VER_1"])
-
-    def test_undefined_symbols_timeout_returns_empty(self) -> None:
-        with mock.patch(
-            "pkgcheck.libdeps.subprocess.run", side_effect=subprocess.TimeoutExpired("readelf", 60)
-        ):
-            self.assertEqual(_undefined_symbols("/x", set(), "readelf"), [])
-
-    def test_undefined_symbols_oserror_returns_empty(self) -> None:
-        with mock.patch("pkgcheck.libdeps.subprocess.run", side_effect=OSError("boom")):
-            self.assertEqual(_undefined_symbols("/x", set(), "readelf"), [])
 
     def test_check_library_deps_future_exception(self) -> None:
         # Force future.result() to raise
@@ -608,8 +493,8 @@ class LibdepsTest(unittest.TestCase):
             f1 = mock.MagicMock()
             f1.result.side_effect = RuntimeError("boom")
             mock_exec.submit.return_value = f1
-            with mock.patch("pkgcheck.libdeps.as_completed", return_value=[f1]):
-                result = check_library_deps(["/x"], 1, "readelf", {})
+            with mock.patch("pkgcheck.libdeps.wait", return_value=([f1], set())):
+                result = check_library_deps(["/x"], 1, "ldd", {})
             self.assertEqual(result, [[]])
 
     def test_collect_defined_symbols_future_exception(self) -> None:
@@ -619,8 +504,8 @@ class LibdepsTest(unittest.TestCase):
             f1 = mock.MagicMock()
             f1.result.side_effect = RuntimeError("boom")
             mock_exec.submit.return_value = f1
-            with mock.patch("pkgcheck.libdeps.as_completed", return_value=[f1]):
-                result = collect_defined_symbols(["/x"], 1, "readelf")
+            with mock.patch("pkgcheck.libdeps.wait", return_value=([f1], set())):
+                result = collect_defined_symbols(["/x"], 1, "nm")
             self.assertEqual(result, set())
 
     def test_check_undefined_symbols_future_exception(self) -> None:
@@ -630,8 +515,8 @@ class LibdepsTest(unittest.TestCase):
             f1 = mock.MagicMock()
             f1.result.side_effect = RuntimeError("boom")
             mock_exec.submit.return_value = f1
-            with mock.patch("pkgcheck.libdeps.as_completed", return_value=[f1]):
-                result = check_undefined_symbols(["/x"], set(), 1, "readelf")
+            with mock.patch("pkgcheck.libdeps.wait", return_value=([f1], set())):
+                result = check_undefined_symbols(["/x"], set(), 1, "nm")
             self.assertEqual(result, [[]])
 
     def test_build_library_owner_index_last_wins(self) -> None:
@@ -1107,7 +992,7 @@ class CliIntegrationTest(unittest.TestCase):
         result = self._run("--check-libs-symbols", "--no-elevate", "--lang", "en")
         self.assertEqual(result.returncode, 2)
         self.assertIn("--check-libs-symbols", result.stderr)
-        self.assertIn("--check-lib-deps", result.stderr)
+        self.assertIn("--check-libs-deps", result.stderr)
 
     def test_packages_dir_nonexistent(self) -> None:
         result = self._run("--packages-dir", "/nonexistent/pkgcheck-dir", "--no-elevate")
@@ -1651,7 +1536,7 @@ class CliRunCoverageTest(unittest.TestCase):
             mock.patch(
                 "pkgcheck.cli.build_library_owner_index", return_value={"libfoo.so.1": "pkg-b"}
             ),
-            mock.patch("pkgcheck.cli.check_library_deps", return_value=[["libmissing.so"], []]),
+            mock.patch("pkgcheck.cli.check_libs_deps", return_value=[["libmissing.so"], []]),
             mock.patch("pkgcheck.cli.collect_defined_symbols", return_value=set()),
             mock.patch("pkgcheck.cli.check_undefined_symbols", return_value=[[], []]),
             mock.patch("pkgcheck.cli.Progress") as MockProgress,
@@ -1664,7 +1549,7 @@ class CliRunCoverageTest(unittest.TestCase):
                     mock.patch("pkgcheck.cli._LOG_DIR", Path(tmp)),
                     mock.patch("os.geteuid", return_value=0),
                 ):
-                    _run(console, status, args, Path("/tmp"), "rg", "readelf", {})
+                    _run(console, status, args, Path("/tmp"), "rg", "ldd", {})
         out = buf.getvalue()
         self.assertIn("Binaries with missing library deps", out)
 
@@ -1685,7 +1570,7 @@ class CliRunCoverageTest(unittest.TestCase):
             mock.patch("pkgcheck.cli.scan_package_files", return_value=scan_result),
             mock.patch("pkgcheck.cli.verify_paths_with_elf", return_value=(statuses, elf_flags)),
             mock.patch("pkgcheck.cli.build_library_owner_index", return_value={}),
-            mock.patch("pkgcheck.cli.check_library_deps", return_value=[[]]),
+            mock.patch("pkgcheck.cli.check_libs_deps", return_value=[[]]),
             mock.patch("pkgcheck.cli.collect_defined_symbols", return_value={"sym1"}),
             mock.patch("pkgcheck.cli.check_undefined_symbols", return_value=[["undef1"]]),
             mock.patch("pkgcheck.cli.Progress") as MockProgress,
@@ -1698,7 +1583,7 @@ class CliRunCoverageTest(unittest.TestCase):
                     mock.patch("pkgcheck.cli._LOG_DIR", Path(tmp)),
                     mock.patch("os.geteuid", return_value=0),
                 ):
-                    _run(console, status, args, Path("/tmp"), "rg", "ldd", "readelf")
+                    _run(console, status, args, Path("/tmp"), "rg", "ldd", "nm")
         out = buf.getvalue()
         self.assertIn("Binaries with undefined symbols", out)
 
@@ -1751,7 +1636,7 @@ class CliRunCoverageTest(unittest.TestCase):
                     mock.patch("pkgcheck.cli._LOG_DIR", Path(tmp)),
                     mock.patch("os.geteuid", return_value=0),
                 ):
-                    _run(console, status, args, Path("/tmp"), "rg", "readelf", {})
+                    _run(console, status, args, Path("/tmp"), "rg", "ldd", {})
         # no broken libs printed, but should not crash
         self.assertNotIn("Binaries with missing", buf.getvalue())
 
@@ -1898,13 +1783,13 @@ class CliMainCoverageTest(unittest.TestCase):
                 self.assertEqual(cm.exception.code, 2)
 
     def test_main_ldd_not_found(self) -> None:
-        # readelf is now optional (pyelftools primary), so --check-lib-deps without readelf should succeed
+        # ldd is required for --check-libs-deps
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 mock.patch.object(
                     sys,
                     "argv",
-                    ["pkgcheck", "--no-elevate", "--packages-dir", tmp, "--check-lib-deps"],
+                    ["pkgcheck", "--no-elevate", "--packages-dir", tmp, "--check-libs-deps"],
                 ),
                 mock.patch("pkgcheck.cli._ensure_utf8_environment", return_value=(None, {})),
                 mock.patch("pkgcheck.cli._ensure_root"),
@@ -1916,12 +1801,10 @@ class CliMainCoverageTest(unittest.TestCase):
             ):
                 import pkgcheck.cli
 
-                # Should not raise SystemExit 2, pyelftools handles it
-                try:
+                with self.assertRaises(SystemExit) as cm:
                     pkgcheck.cli.main()
-                except SystemExit as e:
-                    self.assertNotEqual(e.code, 2)
-                mock_run.assert_called_once()
+                self.assertEqual(cm.exception.code, 2)
+                mock_run.assert_not_called()
 
     def test_main_success_with_mocks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1999,8 +1882,8 @@ class CliMainCoverageTest(unittest.TestCase):
                 # should have printed warning
                 self.assertTrue(mock_console.print.called)
 
-    def test_main_readelf_not_found(self) -> None:
-        # readelf now optional (pyelftools primary), both flags without readelf should succeed
+    def test_main_nm_not_found(self) -> None:
+        # ldd and nm are required for --check-libs-deps / --check-libs-symbols
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 mock.patch.object(
@@ -2011,7 +1894,7 @@ class CliMainCoverageTest(unittest.TestCase):
                         "--no-elevate",
                         "--packages-dir",
                         tmp,
-                        "--check-lib-deps",
+                        "--check-libs-deps",
                         "--check-libs-symbols",
                     ],
                 ),
@@ -2026,11 +1909,10 @@ class CliMainCoverageTest(unittest.TestCase):
             ):
                 import pkgcheck.cli
 
-                try:
+                with self.assertRaises(SystemExit) as cm:
                     pkgcheck.cli.main()
-                except SystemExit as e:
-                    self.assertNotEqual(e.code, 2)
-                mock_run.assert_called_once()
+                self.assertEqual(cm.exception.code, 2)
+                mock_run.assert_not_called()
 
 
 class ScannerCoverageTest(unittest.TestCase):
@@ -2305,9 +2187,7 @@ class ScannerFallbackTest(unittest.TestCase):
         self.assertTrue(_is_pseudo("var/log/syslog", ("var/log/",)))
         self.assertFalse(_is_pseudo("var/log/packages", ("var/log/",)))
 
-
-class SafeLddTest(unittest.TestCase):
-    def test_needed_via_readelf(self) -> None:
+    def test_needed_via_ldd(self) -> None:
         from pkgcheck.libdeps import _get_needed_libs
 
         output = " 0x00000001 (NEEDED)                     Shared library: [libfoo.so.1]\n 0x00000001 (NEEDED)                     Shared library: [libbar.so.2]\n"
@@ -2315,24 +2195,22 @@ class SafeLddTest(unittest.TestCase):
             "pkgcheck.libdeps.subprocess.run",
             return_value=types.SimpleNamespace(stdout=output, stderr=""),
         ):
-            missing = _get_needed_libs("/bin/foo", "readelf")
+            missing = _get_needed_libs("/bin/foo", "ldd")
             # We need to check with owner_index manually
             self.assertIn("libfoo.so.1", missing)
             self.assertIn("libbar.so.2", missing)
 
-    def test_needed_via_readelf_timeout(self) -> None:
+    def test_needed_via_ldd_timeout(self) -> None:
         from pkgcheck.libdeps import _get_needed_libs
 
         with mock.patch(
-            "pkgcheck.libdeps.subprocess.run", side_effect=subprocess.TimeoutExpired("readelf", 60)
+            "pkgcheck.libdeps.subprocess.run", side_effect=subprocess.TimeoutExpired("ldd", 60)
         ):
-            self.assertEqual(_get_needed_libs("/bin/foo", "readelf"), [])
+            self.assertEqual(_get_needed_libs("/bin/foo", "ldd"), [])
 
     def test_check_library_deps_safe(self) -> None:
         with mock.patch("pkgcheck.libdeps._get_needed_libs", side_effect=[["liba.so"], []]):
-            result = check_library_deps(
-                ["/a", "/b"], workers=2, readelf_bin="readelf", owner_index={}
-            )
+            result = check_library_deps(["/a", "/b"], workers=2, ldd_bin="ldd", owner_index={})
             self.assertEqual(result, [["liba.so"], []])
 
 

@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import grp
 import json
 import os
 import shutil
 import sys
 import time
 from collections import defaultdict
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from rich.console import Console
 from rich.progress import (
@@ -31,7 +33,7 @@ from pkgcheck.diff import diff_reports, list_logs
 from pkgcheck.i18n import ALL_LANGUAGES, detect_language, is_supported, set_language, t
 from pkgcheck.libdeps import (
     build_library_owner_index,
-    check_library_deps,
+    check_libs_deps,
     check_undefined_symbols,
     collect_defined_symbols,
     find_missing_owner,
@@ -64,6 +66,7 @@ from pkgcheck.validate import (
     validate_new_suffix,
     validate_orphans_root,
     validate_packages_dir,
+    validate_safe_path,
 )
 from pkgcheck.verifier import (
     _DEFAULT_BACKUP_SUFFIXES,
@@ -72,6 +75,9 @@ from pkgcheck.verifier import (
     verify_paths,
     verify_paths_with_elf,
 )
+
+# Backwards compatibility alias for tests that patch the old singular name
+check_library_deps = check_libs_deps
 
 _DEFAULT_PACKAGES_DIR = "/var/log/packages"
 _DEFAULT_BACKUP_SUFFIXES_CSV = ",".join(_DEFAULT_BACKUP_SUFFIXES)
@@ -183,20 +189,43 @@ def _build_parser() -> argparse.ArgumentParser:
             "Suffix for new config files that Slackware leaves pending review (default: {suffix})."
         ).format(suffix=_DEFAULT_NEW_SUFFIX),
     )
+
+    class _CheckLibsDepsAction(argparse.Action):
+        def __call__(
+            self,
+            _parser: argparse.ArgumentParser,
+            namespace: argparse.Namespace,
+            _values: str | Sequence[Any] | None,
+            _option_string: str | None = None,
+        ) -> None:
+            namespace.check_libs_deps = True
+            namespace.check_lib_deps = True
+
     parser.add_argument(
-        "--check-lib-deps",
-        action="store_true",
+        "--check-libs-deps",
+        dest="check_libs_deps",
+        action=_CheckLibsDepsAction,
+        nargs=0,
         help=t(
             "Also checks that every installed ELF binary and shared library has all "
-            "its dynamic library dependencies present using readelf (safe, no execution)."
+            "its dynamic library dependencies present using ldd."
         ),
     )
+    # Backwards compatibility: singular form deprecated
+    parser.add_argument(
+        "--check-lib-deps",
+        dest="check_lib_deps",
+        action=_CheckLibsDepsAction,
+        nargs=0,
+        help=argparse.SUPPRESS,
+    )
+    parser.set_defaults(check_libs_deps=False, check_lib_deps=False)
     parser.add_argument(
         "--check-libs-symbols",
         action="store_true",
         help=t(
             "Also checks installed binaries for undefined dynamic symbols not provided "
-            "by any installed library (requires --check-lib-deps; may report false "
+            "by any installed library using nm -D (requires --check-libs-deps; may report false "
             "positives)."
         ),
     )
@@ -284,7 +313,7 @@ def _completion_script(shell: str) -> str:
         "--exclude",
         "--backup-suffixes",
         "--new-suffix",
-        "--check-lib-deps",
+        "--check-libs-deps",
         "--check-libs-symbols",
         "--quiet",
         "--lang",
@@ -445,6 +474,9 @@ def main() -> None:
     if args.max_rows is not None and args.max_rows < 1:
         parser.error(t("--max-rows must be a positive integer"))
 
+    if args.max_rows is not None and args.max_rows > 2500:
+        parser.error(t("--max-rows is too large (max {max})").format(max=2500))
+
     try:
         validate_new_suffix(args.new_suffix)
     except ValidationError as exc:
@@ -479,8 +511,8 @@ def main() -> None:
         except ValidationError as exc:
             parser.error(t("invalid rg binary path: {exc}").format(exc=exc))
 
-    if args.check_libs_symbols and not args.check_lib_deps:
-        parser.error(t("--check-libs-symbols requires --check-lib-deps"))
+    if args.check_libs_symbols and not args.check_libs_deps:
+        parser.error(t("--check-libs-symbols requires --check-libs-deps"))
 
     # Validate --exclude prefixes eagerly so user gets feedback
     for value in args.exclude:
@@ -507,19 +539,30 @@ def main() -> None:
         if not orphans_root.is_dir():
             parser.error(t("orphans root does not exist: {path}").format(path=orphans_root))
 
-    # readelf is optional now: pyelftools is primary, readelf only fallback
-    readelf_bin: str | None = shutil.which("readelf")
-    if readelf_bin is not None:
+    # ldd and nm are required for --check-libs-deps / --check-libs-symbols
+    ldd_bin: str | None = None
+    nm_bin: str | None = None
+    if args.check_libs_deps:
+        ldd_bin = shutil.which("ldd")
+        if ldd_bin is None:
+            parser.error(t("ldd was not found on the system; it is required for --check-libs-deps"))
         try:
-            readelf_bin = validate_binary_path(readelf_bin)
+            ldd_bin = validate_binary_path(ldd_bin)
         except ValidationError as exc:
-            parser.error(t("invalid readelf binary path: {exc}").format(exc=exc))
-    elif args.check_lib_deps or args.check_libs_symbols:
-        # No readelf — pyelftools will handle it; keep None for fallback logic
-        readelf_bin = None
+            parser.error(t("invalid ldd binary path: {exc}").format(exc=exc))
+        if args.check_libs_symbols:
+            nm_bin = shutil.which("nm")
+            if nm_bin is None:
+                parser.error(
+                    t("nm was not found on the system; it is required for --check-libs-symbols")
+                )
+            try:
+                nm_bin = validate_binary_path(nm_bin)
+            except ValidationError as exc:
+                parser.error(t("invalid nm binary path: {exc}").format(exc=exc))
 
     try:
-        _run(console, status_console, args, packages_dir, rg_bin, readelf_bin, subprocess_env)
+        _run(console, status_console, args, packages_dir, rg_bin, ldd_bin, nm_bin, subprocess_env)
     except KeyboardInterrupt:
         console.print(t("\n[red]Interrupted by the user.[/red]"))
         raise SystemExit(130) from None
@@ -566,8 +609,17 @@ def _exec_with_sudo() -> None:
     sudo_bin = shutil.which("sudo")
     if sudo_bin is None:
         raise RuntimeError(t("sudo was not found on the system; run pkgcheck directly as root"))
+    try:
+        sudo_bin = validate_binary_path(sudo_bin)
+    except ValidationError as exc:
+        raise RuntimeError(t("invalid sudo binary path: {exc}").format(exc=exc)) from exc
 
     script = str(Path(sys.argv[0]).resolve())
+    # Validate script path to avoid injection via argv[0]
+    try:
+        validate_safe_path(script, allow_absolute=True, must_exist=False)
+    except ValidationError as exc:
+        raise RuntimeError(t("invalid script path: {exc}").format(exc=exc)) from exc
     if Path(script).name == "__main__.py":
         cmd = [sys.executable, "-m", "pkgcheck", *sys.argv[1:]]
     else:
@@ -644,6 +696,11 @@ def _write_auto_log(
     try:
         log_path = unique_report_path(_LOG_DIR, when, fmt)
         _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            Path(_LOG_DIR).chmod(0o755)
+        with contextlib.suppress(OSError, LookupError):
+            gid = grp.getgrnam("wheel").gr_gid
+            os.chown(_LOG_DIR, 0, gid)
         write_report(
             log_path,
             summary,
@@ -673,9 +730,29 @@ def _run(
     args: argparse.Namespace,
     packages_dir: Path,
     rg_bin: str | None,
-    readelf_bin: str | None,
-    subprocess_env: dict[str, str],
+    ldd_bin: str | None = None,
+    nm_bin: str | None = None,
+    subprocess_env: dict[str, str] | None = None,
 ) -> None:
+    # Backwards compatibility: old tests call _run(..., rg_bin, ldd_bin, subprocess_env)
+    # where ldd_bin is a string and subprocess_env is a dict. In that case nm_bin
+    # will be the dict and subprocess_env None.
+    if isinstance(nm_bin, dict) and subprocess_env is None:
+        subprocess_env = nm_bin
+        nm_bin = None
+    if subprocess_env is None:
+        subprocess_env = {}
+    # Handle Mock objects used in tests: hasattr on Mock always True, so check __dict__
+    args_dict = vars(args) if hasattr(args, "__dict__") else {}
+    # Also handle old singular arg name
+    if "check_lib_deps" in args_dict and "check_libs_deps" not in args_dict:
+        args.check_libs_deps = args_dict["check_lib_deps"]
+    # Normalize: ensure check_libs_deps exists even if only singular was set
+    if "check_libs_deps" not in args_dict:
+        args.check_libs_deps = args_dict.get("check_lib_deps", False)
+    # For compatibility, also set singular
+    if "check_lib_deps" not in args_dict:
+        args.check_lib_deps = args.check_libs_deps
     started = time.monotonic()
     when = datetime.now()
     status = status_console if args.json else console
@@ -705,7 +782,7 @@ def _run(
     )
     with Progress(*progress_columns, console=status, disable=args.quiet or args.json) as progress:
         verify_task = progress.add_task(t("Verifying existence of files..."), total=len(entries))
-        if args.check_lib_deps:
+        if args.check_libs_deps:
             statuses, elf_flags = verify_paths_with_elf(
                 abs_paths,
                 args.workers,
@@ -756,8 +833,9 @@ def _run(
         if not args.quiet:
             status.print(t("Scanning for orphan files in {path}...").format(path=orphans_root))
         orphans = find_orphans(owned_set, root=orphans_root, extra_exclude=extra_for_orphans)
-    if args.check_lib_deps:
+    if args.check_libs_deps:
         assert elf_flags is not None
+        assert ldd_bin is not None
         elf_entries = [
             (package, rel)
             for (package, rel), is_elf in zip(entries, elf_flags, strict=True)
@@ -771,14 +849,12 @@ def _run(
                 *progress_columns, console=status, disable=args.quiet or args.json
             ) as progress:
                 deps_task = progress.add_task(
-                    t("Checking library dependencies (readelf)..."), total=len(elf_paths)
+                    t("Checking library dependencies (ldd)..."), total=len(elf_paths)
                 )
-                # readelf_bin is optional (pyelftools primary); pass "" if None for compat
-                effective_readelf = readelf_bin or ""
-                missing_per_path = check_library_deps(
+                missing_per_path = check_libs_deps(
                     elf_paths,
                     args.workers,
-                    effective_readelf,
+                    ldd_bin,
                     owner_index,
                     on_progress=lambda done: progress.update(deps_task, completed=done),
                     extra_env=subprocess_env,
@@ -795,7 +871,7 @@ def _run(
                 missing_lib_count += len(missing)
 
             if args.check_libs_symbols:
-                effective_readelf = readelf_bin or ""
+                assert nm_bin is not None
                 with Progress(
                     *progress_columns, console=status, disable=args.quiet or args.json
                 ) as progress:
@@ -805,7 +881,7 @@ def _run(
                     defined = collect_defined_symbols(
                         elf_paths,
                         args.workers,
-                        effective_readelf,
+                        nm_bin,
                         on_progress=lambda done: progress.update(sym_task, completed=done),
                         extra_env=subprocess_env,
                     )
@@ -819,7 +895,7 @@ def _run(
                         elf_paths,
                         defined,
                         args.workers,
-                        effective_readelf,
+                        nm_bin,
                         on_progress=lambda done: progress.update(undef_task, completed=done),
                         extra_env=subprocess_env,
                     )
@@ -898,6 +974,7 @@ def _run(
             )
         if orphans:
             # Reuse breakdown but orphans are not per-package
+            from rich.text import Text
             from rich.tree import Tree
 
             console.print()
@@ -906,15 +983,11 @@ def _run(
             )
             # group orphans under root count
             branch = tree.add(f"[bold cyan]{t('orphans')} ({len(orphans)})[/bold cyan]")
-            limit = args.max_rows if args.max_rows else len(orphans)
+            limit = args.max_rows if args.max_rows is not None else 2500
             for p in orphans[:limit]:
-                branch.add(p)
-            if args.max_rows and len(orphans) > args.max_rows:
-                tree.add(
-                    t("... and {remaining} more files").format(
-                        remaining=len(orphans) - args.max_rows
-                    )
-                )
+                branch.add(Text(p))
+            if len(orphans) > limit:
+                tree.add(t("... and {remaining} more files").format(remaining=len(orphans) - limit))
             console.print(tree)
             console.print()
 

@@ -242,24 +242,24 @@ class LibdepsExtraTest(unittest.TestCase):
         from pkgcheck.libdeps import _get_needed_libs
 
         with mock.patch("pkgcheck.libdeps.subprocess.run", side_effect=OSError("boom")):
-            self.assertEqual(_get_needed_libs("/x", "readelf"), [])
+            self.assertEqual(_get_needed_libs("/x", "ldd"), [])
 
-    def test_readelf_symbols_none(self) -> None:
-        from pkgcheck.libdeps import _readelf_symbols
+    def test_nm_symbols_none(self) -> None:
+        from pkgcheck.libdeps import _ldd_symbols
 
         with mock.patch("pkgcheck.libdeps.subprocess.run", side_effect=OSError("boom")):
-            self.assertIsNone(_readelf_symbols("/x", "readelf"))
+            self.assertIsNone(_ldd_symbols("/x", "nm"))
 
     def test_undefined_symbols_empty(self) -> None:
         from pkgcheck.libdeps import _undefined_symbols
 
         with mock.patch("pkgcheck.libdeps.subprocess.run", side_effect=OSError("boom")):
-            self.assertEqual(_undefined_symbols("/x", set(), "readelf"), [])
+            self.assertEqual(_undefined_symbols("/x", set(), "nm"), [])
 
     def test_check_library_deps_with_progress(self) -> None:
         events = []
         res = check_library_deps(
-            [], workers=2, readelf_bin="readelf", owner_index={}, on_progress=events.append
+            [], workers=2, ldd_bin="ldd", owner_index={}, on_progress=events.append
         )
         self.assertEqual(res, [])
 

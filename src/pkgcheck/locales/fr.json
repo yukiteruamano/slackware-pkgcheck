@@ -72,7 +72,6 @@
   "Also checks installed binaries for undefined dynamic symbols not provided by any installed library (requires --check-libs-deps; may report false positives).": "Vérifie aussi les binaires installés avec des symboles dynamiques non définis non fournis par une bibliothèque installée (nécessite --check-libs-deps; peut signaler des faux positifs).",
   "--check-libs-symbols requires --check-libs-deps": "--check-libs-symbols nécessite --check-libs-deps",
   "ldd was not found on the system; it is required for --check-libs-deps": "ldd introuvable sur le système; requis pour --check-libs-deps",
-  "readelf was not found on the system; it is required for --check-libs-symbols": "readelf introuvable sur le système; requis pour --check-libs-symbols",
   "Checking library dependencies (ldd)...": "Vérification des dépendances de bibliothèques (ldd)...",
   "Collecting defined symbols...": "Collecte des symboles définis...",
   "Checking undefined symbols...": "Vérification des symboles non définis...",
@@ -87,5 +86,6 @@
   "BROKEN LIBRARY DEPS:": "DÉPENDANCES DE BIBLIOTHÈQUES CASSÉES :",
   "UNDEFINED SYMBOLS (may be false positives):": "SYMBOLES NON DÉFINIS (peuvent être des faux positifs) :",
   "(unknown)": "(inconnu)",
-  "[yellow]Warning: terminal encoding is not UTF-8 (detected: {encoding}). Using fallback LANG=en_US/UTF-8 to avoid output errors.[/yellow]": "[yellow]Attention : l'encodage du terminal n'est pas UTF-8 (détecté : {encoding}). Utilisation du repli LANG=en_US/UTF-8 pour éviter les erreurs de sortie.[/yellow]"
+  "[yellow]Warning: terminal encoding is not UTF-8 (detected: {encoding}). Using fallback LANG=en_US/UTF-8 to avoid output errors.[/yellow]": "[yellow]Attention : l'encodage du terminal n'est pas UTF-8 (détecté : {encoding}). Utilisation du repli LANG=en_US/UTF-8 pour éviter les erreurs de sortie.[/yellow]",
+  "nm was not found on the system; it is required for --check-libs-symbols": "nm introuvable sur le système; requis pour --check-libs-symbols"
 }

@@ -328,7 +328,7 @@ def validate_orphans_root(path: str) -> str:
 
 
 def validate_binary_path(bin_name: str) -> str:
-    """Validate a binary name (rg, readelf, etc.) found via shutil.which()."""
+    """Validate a binary name (rg, ldd, nm, etc.) found via shutil.which()."""
     if not isinstance(bin_name, str):
         raise ValidationError(f"Binary name must be string, got {type(bin_name).__name__}")
 

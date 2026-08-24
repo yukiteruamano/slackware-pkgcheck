@@ -42,6 +42,8 @@ _INSTALL_PREFIX = "install/"
 # it lives under `var/log/` (it is the package database itself).
 # Also preserve `var/log/pkgcheck/` (our logs) and `var/log/setup/` (Slackware setup logs).
 # Exclude other package managers' databases.
+# `lib64/incoming/` and `lib/incoming/` are staging areas for glibc upgrades
+# (files not yet moved to their final location); they must not be counted as missing.
 _PSEUDO_PREFIXES = (
     "dev/",
     "sys/",
@@ -62,6 +64,8 @@ _PSEUDO_PREFIXES = (
     "media/",
     "srv/",
     "lost+found/",
+    "lib/incoming/",
+    "lib64/incoming/",
 )
 
 _RG_TIMEOUT = 300
@@ -78,6 +82,16 @@ def _is_safe_rel(rel: str) -> bool:
     """
     if not rel or rel.startswith("/"):
         return False
+    # Length check (same as validate.py MAX_PATH_LENGTH)
+    if len(rel) > 4096:
+        return False
+    # Control / forbidden chars (no injection, no weird FS probing)
+    if "\x00" in rel or "\n" in rel or "\r" in rel or "\t" in rel:
+        return False
+    for ch in rel:
+        o = ord(ch)
+        if o < 32 or o == 127:
+            return False
     # Reject empty segments (//), current dir (./) and traversal (..) in any position
     parts = rel.split("/")
     for p in parts:

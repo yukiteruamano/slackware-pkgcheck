@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import grp
 import json
 import os
 import tempfile
@@ -11,7 +13,9 @@ from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
+from rich.text import Text
 from rich.tree import Tree
 
 from pkgcheck import __version__
@@ -173,11 +177,11 @@ def print_breakdown(
             remaining = len(missing_by_package) - index
             tree.add(t("... and {remaining} more packages").format(remaining=remaining))
             break
-        branch = tree.add(f"[bold cyan]{package}[/bold cyan] ({len(paths)})")
+        branch = tree.add(f"[bold cyan]{escape(package)}[/bold cyan] ({len(paths)})")
         # Limit paths per package to respect max_rows (show max_rows files per package)
-        limit = max_rows if max_rows is not None else 1000
+        limit = max_rows if max_rows is not None else 2500
         for p in paths[:limit]:
-            branch.add(p)
+            branch.add(Text(p))
         if len(paths) > limit:
             branch.add(t("... and {remaining} more files").format(remaining=len(paths) - limit))
     console.print(tree)
@@ -202,8 +206,9 @@ def print_broken_libs(
             remaining = len(broken_libs) - index
             tree.add(t("... and {remaining} more packages").format(remaining=remaining))
             break
-        branch = tree.add(f"[bold cyan]{package}[/bold cyan] ({len(items)})")
-        for item in items:
+        branch = tree.add(f"[bold cyan]{escape(package)}[/bold cyan] ({len(items)})")
+        limit = max_rows if max_rows is not None else 2500
+        for item in items[:limit]:
             deps = ", ".join(item.missing)
             provided = ", ".join(
                 f"{lib}={owner or t('(unknown)')}" for lib, owner in item.provided_by.items()
@@ -211,7 +216,9 @@ def print_broken_libs(
             label = f"{item.binary} -> {deps}"
             if provided:
                 label = f"{label} [{provided}]"
-            branch.add(label)
+            branch.add(Text(label))
+        if len(items) > limit:
+            branch.add(t("... and {remaining} more files").format(remaining=len(items) - limit))
     console.print(tree)
     console.print()
 
@@ -258,11 +265,29 @@ def write_report(
         )
     # Atomic write via temp file in same directory to avoid partial logs on crash
     output.parent.mkdir(parents=True, exist_ok=True)
+    # Ensure directory is 0755 (mkdir respects umask, so enforce)
+    with contextlib.suppress(OSError):
+        Path(output.parent).chmod(0o755)
+    with contextlib.suppress(OSError, LookupError):
+        gid = grp.getgrnam("wheel").gr_gid
+        os.chown(output.parent, 0, gid)
     fd, tmp_path = tempfile.mkstemp(dir=str(output.parent), prefix=".pkgcheck-")
+    # Ensure log is 0644 regardless of umask (mkstemp creates 0600)
+    with contextlib.suppress(OSError):
+        os.fchmod(fd, 0o644)
+    with contextlib.suppress(OSError, LookupError):
+        gid = grp.getgrnam("wheel").gr_gid
+        os.fchown(fd, 0, gid)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
         os.replace(tmp_path, output)
+        # Enforce 0644 on final file (replace preserves tmp perms, but ensure)
+        with contextlib.suppress(OSError):
+            Path(output).chmod(0o644)
+        with contextlib.suppress(OSError, LookupError):
+            gid = grp.getgrnam("wheel").gr_gid
+            os.chown(output, 0, gid)
     except OSError:
         try:
             os.unlink(tmp_path)

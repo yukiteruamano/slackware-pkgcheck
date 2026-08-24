@@ -277,7 +277,7 @@ class ValidateBinaryPathTest(unittest.TestCase):
             validate_binary_path("bad;name")
 
     def test_simple_ok(self) -> None:
-        self.assertEqual(validate_binary_path("readelf"), "readelf")
+        self.assertEqual(validate_binary_path("ldd"), "ldd")
 
 
 class ValidatePackagesOrphansTest(unittest.TestCase):

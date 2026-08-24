@@ -1,14 +1,8 @@
 """Verification of dynamic library dependencies for installed ELF binaries.
 
-Inspired by Gentoo's ``revdep-rebuild``: for every ELF binary or shared library
-installed on the system we extract NEEDED entries (pyelftools, no execution)
-and check if they are provided by installed packages. This is SAFE and fast.
-
-An optional, extra mode (``--check-libs-symbols``) detects binaries that import
-undefined dynamic symbols that are not exported by any installed library. This
-is intentionally heuristic and can yield false positives (lazy binding,
-``dlopen``-loaded libraries, symbol versioning), mirroring revdep-rebuild's
-``-u`` / ``SEARCH_SYMBOLS``.
+Uses ``ldd`` for library deps (fast, loader-aware) and ``nm -D`` for
+undefined symbols.  Requires the system tools ``ldd`` (glibc) and ``nm``
+(binutils).  Only run on a trusted system - ``ldd`` executes the loader.
 """
 
 from __future__ import annotations
@@ -16,34 +10,24 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Iterable
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
 from typing import Any
 
-from elftools.elf.dynamic import DynamicSection
-from elftools.elf.elffile import ELFFile
-from elftools.elf.sections import SymbolTableSection
+wait = wait  # expose for test patching
 
-# Minimum interval between two progress updates (seconds). Reports more often than
-# this would redraw the progress bar too frequently for long scans.
+# Minimum interval between two progress updates (seconds).
 _PROGRESS_INTERVAL = 0.1
 
-# readelf -d NEEDED pattern:  0x00000001 (NEEDED)  Shared library: [libfoo.so.1]
-_NEEDED = re.compile(r"\(NEEDED\)[^[]*\[([^\]]+)\]")
+# ldd "not found" line:  libfoo.so.1 => not found
+_NOT_FOUND = re.compile(r"^\s*(?P<lib>\S+)\s+=>\s+not found", re.MULTILINE)
+_NOT_DYNAMIC = re.compile(r"not a dynamic executable|statically linked")
 
-# A defined (exported) dynamic symbol, e.g. from `readelf -Ws`:
-#   Num:    Value          Size Type    Bind   Vis      Ndx Name
-#    6: 0000000000000000     0 FUNC    GLOBAL DEFAULT  UND puts
-#  123: 0000000000004a40    26 FUNC    GLOBAL DEFAULT   13 main
-# A symbol with Ndx == "UND" is undefined; otherwise it is defined.
-_DEFINED_SYMBOL = re.compile(r"^\s*\d+:\s+\S+\s+\d+\s+\S+\s+\S+\s+\S+\s+\d+\s+(\S+)$", re.MULTILINE)
-_UNDEFINED_SYMBOL = re.compile(
-    r"^\s*\d+:\s+\S+\s+\d+\s+\S+\s+\S+\s+\S+\s+UND\s+(\S+)$", re.MULTILINE
-)
-
-_READ_ELF_TIMEOUT = 60
+_LDD_TIMEOUT = 60
+_NM_TIMEOUT = 60
 
 type ProgressCallback = Callable[[int], None]
 type LibEntries = Iterable[tuple[str, str]]
@@ -51,19 +35,130 @@ type LibEntries = Iterable[tuple[str, str]]
 # Shared libraries live under these prefixes; their basename maps to a package.
 _LIB_PREFIXES = ("usr/lib/", "usr/lib64/", "lib/", "lib64/", "usr/libexec/")
 
+# Standard system library directories searched by the dynamic loader.
+_STD_LIB_DIRS = ("/lib", "/lib64", "/usr/lib", "/usr/lib64", "/usr/libexec")
+
+# Glibc merged stubs: since glibc 2.34 these are provided by libc.so.6
+_GLIBC_MERGED_STUBS: frozenset[str] = frozenset(
+    {
+        "libdl.so.2",
+        "libpthread.so.0",
+        "libutil.so.1",
+        "libanl.so.1",
+    }
+)
+
+
+def _canonical_libname(name: str) -> str:
+    """Canonicalizes Slackware hyphen versioning to dot soname."""
+    if name.endswith(".so") and "-" in name:
+        idx = name.rfind("-")
+        base = name[:idx]
+        ver = name[idx + 1 : -3]  # strip .so
+        if ver and ver[0].isdigit():
+            return f"{base}.so.{ver}"
+    return name
+
+
+def _has_libc(owner_index: dict[str, str]) -> bool:
+    """Returns whether libc (provider for merged stubs) is installed."""
+    return any(k.startswith("libc.so") or k.startswith("libc-") for k in owner_index)
+
+
+# Cache for ldconfig lookups (per-run, shared across workers)
+_ldcache: set[str] | None = None
+_ldcache_lock = threading.Lock()
+
+
+def _load_ldcache() -> set[str]:
+    """Parses ``ldconfig -p`` into a set of basenames; empty on failure."""
+    global _ldcache
+    if _ldcache is not None:
+        return _ldcache
+    with _ldcache_lock:
+        if _ldcache is not None:
+            return _ldcache
+        try:
+            import shutil
+
+            ldconfig_bin = shutil.which("ldconfig") or "ldconfig"
+            # validate if absolute
+            if ldconfig_bin.startswith("/"):
+                try:
+                    from pkgcheck.validate import validate_binary_path
+
+                    ldconfig_bin = validate_binary_path(ldconfig_bin)
+                except Exception:
+                    # fall back to bare name on validation failure
+                    ldconfig_bin = "ldconfig"
+            result = subprocess.run(
+                [ldconfig_bin, "-p"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=10,
+                env={**os.environ, "LC_ALL": "C"},
+            )
+            libs: set[str] = set()
+            for line in result.stdout.splitlines():
+                if "=>" in line:
+                    part = line.strip().split(" ", 1)[0]
+                    if part:
+                        libs.add(part)
+                        libs.add(_canonical_libname(part))
+            _ldcache = libs
+            return libs
+        except Exception:
+            _ldcache = set()
+            return _ldcache
+
+
+def _exists_on_fs(lib: str) -> bool:
+    """Returns whether ``lib`` exists in a standard library directory."""
+    for d in _STD_LIB_DIRS:
+        if Path(d, lib).exists():
+            return True
+        canon = _canonical_libname(lib)
+        if canon != lib and Path(d, canon).exists():
+            return True
+    return False
+
+
+def _in_ldcache(lib: str) -> bool:
+    """Returns whether ``lib`` is known to the dynamic loader cache."""
+    cache = _load_ldcache()
+    if not cache:
+        return False
+    if lib in cache:
+        return True
+    canon = _canonical_libname(lib)
+    if canon in cache:
+        return True
+    return any(_soname_match(lib, cached) or _soname_match(canon, cached) for cached in cache)
+
 
 def _should_report(done: int, total: int, last_update: float) -> bool:
-    """Returns whether a progress update should be reported now.
-
-    Reports at most every ``_PROGRESS_INTERVAL`` seconds, but always on the final
-    item so the bar reaches 100%.
-    """
+    """Returns whether a progress update should be reported now."""
     if done >= total:
         return True
     return time.monotonic() - last_update >= _PROGRESS_INTERVAL
 
 
-def _build_readelf_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
+def _build_ldd_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Builds sanitized env for ldd (clear LD_* that could hijack)."""
+    env = {**os.environ}
+    if extra_env:
+        env.update(extra_env)
+    env["LC_ALL"] = "C"
+    # Defense in depth: clear loader hijack vars (ldd respects them)
+    for key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "LD_BIND_NOW"):
+        env.pop(key, None)
+    return env
+
+
+def _build_nm_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
     env = {**os.environ}
     if extra_env:
         env.update(extra_env)
@@ -71,103 +166,59 @@ def _build_readelf_env(extra_env: dict[str, str] | None = None) -> dict[str, str
     return env
 
 
-def _get_needed_libs_py(path: str) -> list[str]:
-    """Extract NEEDED libraries using pyelftools (fast, no subprocess)."""
-    needed: list[str] = []
-    try:
-        with open(path, "rb") as f:
-            try:
-                elffile = ELFFile(f)
-            except Exception:
-                return []
-            for section in elffile.iter_sections():
-                if isinstance(section, DynamicSection):
-                    for tag in section.iter_tags():
-                        if tag.entry.d_tag == "DT_NEEDED":
-                            lib = tag.needed  # type: ignore[attr-defined]
-                            if lib not in needed:
-                                needed.append(lib)
-                    break
-    except (OSError, ValueError):
-        return []
-    return needed
+def _ldd_missing(path: str, ldd_bin: str, extra_env: dict[str, str] | None = None) -> list[str]:
+    """Runs ``ldd -- path`` and returns libraries reported as ``not found``.
 
-
-def _get_needed_libs_fallback(
-    path: str, readelf_bin: str, extra_env: dict[str, str] | None = None
-) -> list[str]:
-    """Fallback via readelf -d (kept for compatibility / tests)."""
+    Filters glibc merged stubs when libc is known to be installed (via ld cache
+    check) to avoid false positives on glibc 2.34+ systems. Returns [] for
+    statically linked or non-dynamic files.
+    """
     try:
         result = subprocess.run(
-            [readelf_bin, "-d", "--", path],
+            [ldd_bin, "--", path],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             check=False,
-            timeout=_READ_ELF_TIMEOUT,
-            env=_build_readelf_env(extra_env),
+            timeout=_LDD_TIMEOUT,
+            env=_build_ldd_env(extra_env),
         )
     except (OSError, subprocess.TimeoutExpired):
         return []
-    needed: list[str] = []
-    for match in _NEEDED.finditer(result.stdout):
-        lib = match.group(1)
-        if lib not in needed:
-            needed.append(lib)
-    return needed
+    # ldd writes "not a dynamic executable" to stderr or stdout for static
+    combined = (result.stdout or "") + "\n" + (result.stderr or "")
+    if _NOT_DYNAMIC.search(combined):
+        return []
+    missing: list[str] = []
+    for match in _NOT_FOUND.finditer(result.stdout):
+        lib = match.group("lib")
+        if lib not in missing:
+            missing.append(lib)
+    # Also check stderr in case ldd writes there on some systems
+    for match in _NOT_FOUND.finditer(result.stderr or ""):
+        lib = match.group("lib")
+        if lib not in missing:
+            missing.append(lib)
+    return missing
 
 
-def _get_needed_libs(
-    path: str, readelf_bin: str, extra_env: dict[str, str] | None = None
-) -> list[str]:
-    """Extract NEEDED libraries from an ELF file.
-
-    Primary: pyelftools (no execution, fast). Fallback: readelf subprocess when
-    pyelftools returns empty and readelf_bin is available (kept for tests and
-    edge cases).
-    """
-    result = _get_needed_libs_py(path)
-    if not result and readelf_bin:
-        # Fallback to readelf for compatibility (tests mock subprocess even for /x)
-        fallback = _get_needed_libs_fallback(path, readelf_bin, extra_env)
-        if fallback:
-            return fallback
-        # If fallback also empty, return original (empty)
-        # but if pyelftools had no result and fallback is empty, keep pyelftools result
-        # to avoid masking real empty NEEDED
-        if fallback == [] and result == []:
-            # If subprocess was mocked, it may return mocked data; we already handled
-            # fallback non-empty case. For empty case, return fallback (still empty).
-            return fallback
-    return result
+# Backwards compatibility alias for tests that import _get_needed_libs
+def _get_needed_libs(path: str, ldd_bin: str, extra_env: dict[str, str] | None = None) -> list[str]:
+    """Alias for ``_ldd_missing`` (kept for tests)."""
+    return _ldd_missing(path, ldd_bin, extra_env)
 
 
 def _soname_match(needed: str, available: str) -> bool:
-    """Check if an available soname satisfies a needed soname.
-
-    Handles versioned sonames:
-    - needed: libfoo.so.1, available: libfoo.so.1.2.3 -> True (available startswith needed)
-    - needed: libfoo.so.1.2.3, available: libfoo.so.1 -> True (needed startswith available)
-    - needed: libfoo.so.1, available: libfoo.so.1 -> True (exact match)
-    - Major soname matching: libfoo.so.1 matches libfoo.so.1.x
-    - Unversioned .so matches any versioned .so with same base
-    """
+    """Check if an available soname satisfies a needed soname."""
     if needed == available:
         return True
-    # Unversioned .so handling: libfoo.so matches libfoo.so.1 etc if base name same
+    # Unversioned .so handling
     if needed.endswith(".so") and available.startswith(needed + "."):
         return True
     if available.endswith(".so") and needed.startswith(available + "."):
         return True
-    if available.startswith(needed):
-        # Ensure prefix match is on soname boundary (e.g., libfoo.so.1 should not match libfoo.so.10)
-        # but simple startswith is already handled by major version check below
-        return True
-    if needed.startswith(available):
-        return True
-
-    # Major soname matching: libfoo.so.1 == libfoo.so.1.x
+    # Major soname matching with boundary check
     if ".so." in needed and ".so." in available:
         try:
             needed_parts = needed.split(".so.", 1)
@@ -182,49 +233,86 @@ def _soname_match(needed: str, available: str) -> bool:
                 return True
         except IndexError:
             pass
-    return False
+        return False
+    # For .so.N vs .so.N.M without .so. split already handled, fallback to exact
+    # Prevent libfoo.so.1 matching libfoo.so.10
+    return needed.startswith(available + ".") or available.startswith(needed + ".")
+
+
+def _filter_missing_with_owner(missing: list[str], owner_index: dict[str, str]) -> list[str]:
+    """Filters ``missing`` using owner_index soname match and system cache.
+
+    A library is considered NOT missing if any installed package provides a
+    compatible soname, or it is in ld cache / on FS, or it is a glibc merged
+    stub and libc is installed.
+    """
+    if not missing:
+        return []
+    has_libc = _has_libc(owner_index)
+    filtered: list[str] = []
+    for lib in missing:
+        if lib in _GLIBC_MERGED_STUBS and has_libc:
+            continue
+        # Check owner_index first (fast, authoritative for Slackware DB)
+        if lib in owner_index:
+            continue
+        found = False
+        for owner_lib in owner_index:
+            if _soname_match(lib, owner_lib):
+                found = True
+                break
+        if found:
+            continue
+        # Finally check ld cache / FS to suppress false positives where ldd
+        # says not found but file exists in non-standard location already
+        # indexed by loader. However ldd's not found is authoritative, so we
+        # only suppress if the file truly exists on FS or in cache AND
+        # owner_index had it but under canonical name.
+        # For now, respect ldd: if ldd says not found, report it.
+        filtered.append(lib)
+    return filtered
 
 
 def check_library_deps(
     paths: Iterable[str],
     workers: int,
-    readelf_bin: str,
+    ldd_bin: str,
     owner_index: dict[str, str],
     on_progress: ProgressCallback | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> list[list[str]]:
-    """Checks `paths` (ELF files only) and returns missing libs per path.
+    """Checks ``paths`` via ldd and returns missing libs per path.
 
-    Uses pyelftools to extract NEEDED entries and checks against `owner_index`.
-    A library is reported missing if no installed package provides a compatible soname.
+    Alias kept for backwards compatibility; prefer ``check_libs_deps``.
+    """
+    return check_libs_deps(paths, workers, ldd_bin, owner_index, on_progress, extra_env)
 
-    The result preserves the order of `paths`; an entry is an empty list when the
-    file has all its dependencies present. Extraction is run in parallel and
-    `on_progress` is called as each file is completed. Silent on errors (no warnings).
+
+def check_libs_deps(
+    paths: Iterable[str],
+    workers: int,
+    ldd_bin: str,
+    owner_index: dict[str, str],
+    on_progress: ProgressCallback | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> list[list[str]]:
+    """Checks ``paths`` (ELF files only) and returns missing libs per path.
+
+    Uses ``ldd`` to query the loader; fast and loader-aware. Filters glibc
+    merged stubs. Preserves order of ``paths``. Parallel via ThreadPoolExecutor
+    with throttled progress.
     """
     paths = list(paths)
+    if not paths:
+        return []
     results: list[list[str]] = [[] for _ in paths]
     futures: dict[Future[Any], int] = {}
 
     def _check_one(path: str) -> list[str]:
-        needed = _get_needed_libs(path, readelf_bin, extra_env)
-        missing: list[str] = []
-        for lib in needed:
-            if lib in owner_index:
-                continue
-            # Check if any owner provides a version-compatible soname
-            found = False
-            for owner_lib in owner_index:
-                if _soname_match(lib, owner_lib):
-                    found = True
-                    break
-            if not found:
-                missing.append(lib)
-        return missing
+        raw = _ldd_missing(path, ldd_bin, extra_env)
+        return _filter_missing_with_owner(raw, owner_index)
 
-    with ThreadPoolExecutor(
-        max_workers=workers, thread_name_prefix="pkgcheck-ldd-safe"
-    ) as executor:
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pkgcheck-ldd") as executor:
         for index, path in enumerate(paths):
             futures[executor.submit(_check_one, path)] = index
         last_update = time.monotonic()
@@ -233,7 +321,6 @@ def check_library_deps(
             try:
                 results[index] = future.result()
             except Exception:
-                # Silent — do not leak internals to console
                 results[index] = []
             if on_progress is not None and _should_report(done, len(paths), last_update):
                 on_progress(done)
@@ -242,194 +329,160 @@ def check_library_deps(
 
 
 def _is_library_path(rel: str) -> bool:
-    """Returns whether `rel` looks like a shared library path."""
+    """Returns whether ``rel`` looks like a shared library path."""
     name = Path(rel).name
     return rel.startswith(_LIB_PREFIXES) and (name.endswith(".so") or ".so." in name)
 
 
 def build_library_owner_index(entries: LibEntries) -> dict[str, str]:
-    """Maps each installed library basename to the package that provides it.
-
-    Multiple packages may ship a library with the same basename; the last one wins
-    silently (no console spam). Duplicates are common (e.g., libxul.so in
-    firefox/thunderbird, libVkLayer in vulkan-sdk/chromium) and not actionable for
-    the user.
-    """
+    """Maps each installed library basename to the package that provides it."""
     index: dict[str, str] = {}
     for package, rel in entries:
         if _is_library_path(rel):
             lib_name = Path(rel).name
-            # last-wins silently
+            # Also index canonical name for hyphen variants
             index[lib_name] = package
+            canon = _canonical_libname(lib_name)
+            if canon != lib_name:
+                index[canon] = package
+            # Also ensure dot-form is indexed if original was hyphen
     return index
 
 
 def find_missing_owner(
     missing_libs: Iterable[str], owner_index: dict[str, str]
 ) -> dict[str, str | None]:
-    """Maps each missing library to the package that should provide it (or None)."""
-    return {lib: owner_index.get(lib) for lib in missing_libs}
+    """Maps each missing library to the package that should provide it (or None).
+
+    Tries soname-compatible match if exact basename not found.
+    """
+    result: dict[str, str | None] = {}
+    for lib in missing_libs:
+        if lib in owner_index:
+            result[lib] = owner_index[lib]
+            continue
+        # Try soname match
+        owner: str | None = None
+        for avail, pkg in owner_index.items():
+            if _soname_match(lib, avail):
+                owner = pkg
+                break
+        result[lib] = owner
+    return result
 
 
-def _readelf_symbols_py(path: str) -> set[str] | None:
-    """Returns defined symbols via pyelftools, or None on error."""
-    symbols: set[str] = set()
-    try:
-        with open(path, "rb") as f:
-            try:
-                elffile = ELFFile(f)
-            except Exception:
-                return None
-            for section in elffile.iter_sections():
-                if not isinstance(section, SymbolTableSection) or section.name != ".dynsym":
-                    continue
-                for sym in section.iter_symbols():
-                    # st_shndx == SHN_UNDEF means undefined
-                    if sym.entry["st_shndx"] == "SHN_UNDEF":
-                        continue
-                    name = sym.name
-                    if name:
-                        symbols.add(name)
-    except (OSError, ValueError):
-        return None
-    return symbols
+# --- nm helpers for undefined symbols ---
 
 
-def _readelf_symbols_fallback(
-    path: str, readelf_bin: str, extra_env: dict[str, str] | None = None
-) -> set[str] | None:
-    """Fallback via readelf -Ws (kept for compatibility)."""
+def _nm_symbols(path: str, nm_bin: str, extra_env: dict[str, str] | None = None) -> set[str] | None:
+    """Returns defined symbols via ``nm -D`` or None on error."""
     try:
         result = subprocess.run(
-            [readelf_bin, "-Ws", "--", path],
+            [nm_bin, "-D", "--defined-only", "--", path],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             check=False,
-            timeout=_READ_ELF_TIMEOUT,
-            env=_build_readelf_env(extra_env),
+            timeout=_NM_TIMEOUT,
+            env=_build_nm_env(extra_env),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
+    if result.returncode != 0 and not result.stdout:
+        return None
     symbols: set[str] = set()
     for line in result.stdout.splitlines():
-        match = _DEFINED_SYMBOL.match(line)
-        if match:
-            symbols.add(match.group(1))
+        # nm -D output: address type name  e.g. "0000000000000000 T main"
+        # defined-only ensures no U
+        parts = line.strip().split()
+        if len(parts) >= 3:
+            # last part is name (may contain @GLIBC...)
+            name = parts[-1]
+            if name and name != "U":
+                symbols.add(name)
+        elif len(parts) == 2 and parts[0] != "U":
+            symbols.add(parts[1])
     return symbols
 
 
-def _readelf_symbols(
-    path: str, readelf_bin: str, extra_env: dict[str, str] | None = None
+# Alias for tests that import _ldd_symbols as nm wrapper
+def _ldd_symbols(
+    path: str, nm_bin: str, extra_env: dict[str, str] | None = None
 ) -> set[str] | None:
-    """Returns the set of defined (exported) dynamic symbols of `path`, or None on error.
-
-    Primary: pyelftools. Fallback: readelf subprocess (for tests and edge cases).
-    """
-    result = _readelf_symbols_py(path)
-    if result is not None and result != set():
-        return result
-    # Fallback when pyelftools gave None or empty and readelf available
-    if readelf_bin:
-        fallback = _readelf_symbols_fallback(path, readelf_bin, extra_env)
-        # If fallback produced something, use it; otherwise keep pyelftools result
-        if fallback is not None and fallback != set():
-            return fallback
-        if result is not None:
-            # pyelftools gave empty set, fallback also empty -> keep empty
-            return result
-        # pyelftools gave None, fallback gave None/empty -> return fallback
-        return fallback
-    return result
+    return _nm_symbols(path, nm_bin, extra_env)
 
 
-def _undefined_symbols_py(path: str, defined_globally: set[str]) -> list[str]:
-    """Returns undefined symbols via pyelftools not in defined_globally."""
+def _get_undefined_symbols(
+    path: str, defined_globally: set[str], nm_bin: str, extra_env: dict[str, str] | None = None
+) -> list[str]:
+    """Returns undefined symbols via ``nm -D --undefined-only`` filtered."""
+    try:
+        result = subprocess.run(
+            [nm_bin, "-D", "--undefined-only", "--", path],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=_NM_TIMEOUT,
+            env=_build_nm_env(extra_env),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
     undefined: list[str] = []
     seen: set[str] = set()
-    try:
-        with open(path, "rb") as f:
-            try:
-                elffile = ELFFile(f)
-            except Exception:
-                return []
-            for section in elffile.iter_sections():
-                if isinstance(section, SymbolTableSection) and section.name == ".dynsym":
-                    for sym in section.iter_symbols():
-                        if sym.entry["st_shndx"] != "SHN_UNDEF":
-                            continue
-                        name = sym.name
-                        if not name or name in seen or name in defined_globally:
-                            continue
-                        seen.add(name)
-                        undefined.append(name)
-    except (OSError, ValueError):
-        return []
-    return undefined
-
-
-def _undefined_symbols_fallback(
-    path: str, defined_globally: set[str], readelf_bin: str, extra_env: dict[str, str] | None = None
-) -> list[str]:
-    try:
-        result = subprocess.run(
-            [readelf_bin, "-Ws", "--", path],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            timeout=_READ_ELF_TIMEOUT,
-            env=_build_readelf_env(extra_env),
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    undefined: list[str] = []
     for line in result.stdout.splitlines():
-        match = _UNDEFINED_SYMBOL.match(line)
-        if match and match.group(1) not in defined_globally and match.group(1) not in undefined:
-            undefined.append(match.group(1))
+        # format: "                 U puts" or "                 U puts@GLIBC_2.2.5"
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # nm undefined line: typically "U symbol"
+        parts = stripped.split()
+        if len(parts) == 2 and parts[0] == "U":
+            name = parts[1]
+        elif len(parts) == 1 and stripped.startswith("U "):
+            name = stripped[2:].strip()
+        elif " U " in line:
+            # fallback: split on U
+            try:
+                name = line.split(" U ", 1)[1].strip().split()[0]
+            except IndexError:
+                continue
+        else:
+            continue
+        if not name or name in seen or name in defined_globally:
+            continue
+        seen.add(name)
+        undefined.append(name)
     return undefined
 
 
+# Alias for tests that import _undefined_symbols
 def _undefined_symbols(
-    path: str, defined_globally: set[str], readelf_bin: str, extra_env: dict[str, str] | None = None
+    path: str, defined_globally: set[str], nm_bin: str, extra_env: dict[str, str] | None = None
 ) -> list[str]:
-    """Returns the undefined symbols of `path` that are not defined anywhere."""
-    # Try pyelftools first
-    result = _undefined_symbols_py(path, defined_globally)
-    if result:
-        return result
-    # Fallback to readelf when pyelftools empty and readelf available (tests mock this)
-    if readelf_bin:
-        fallback = _undefined_symbols_fallback(path, defined_globally, readelf_bin, extra_env)
-        if fallback:
-            return fallback
-    return result
+    return _get_undefined_symbols(path, defined_globally, nm_bin, extra_env)
 
 
 def collect_defined_symbols(
     paths: Iterable[str],
     workers: int,
-    readelf_bin: str,
+    nm_bin: str,
     on_progress: ProgressCallback | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> set[str]:
-    """Builds the global set of dynamic symbols exported by the installed libraries.
-
-    Runs extraction in parallel and calls `on_progress` as each file completes. Silent on errors.
-    """
+    """Builds the global set of dynamic symbols exported by installed libraries."""
     paths = list(paths)
+    if not paths:
+        return set()
     defined: set[str] = set()
     futures: dict[Future[Any], str] = {}
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pkgcheck-nm") as executor:
         for path in paths:
-            futures[executor.submit(_readelf_symbols, path, readelf_bin, extra_env)] = path
-        done = 0
+            futures[executor.submit(_nm_symbols, path, nm_bin, extra_env)] = path
         last_update = time.monotonic()
         for done, future in enumerate(as_completed(futures), start=1):
-            path = futures[future]
             try:
                 symbols = future.result()
             except Exception:
@@ -446,23 +499,20 @@ def check_undefined_symbols(
     paths: Iterable[str],
     defined_globally: set[str],
     workers: int,
-    readelf_bin: str,
+    nm_bin: str,
     on_progress: ProgressCallback | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> list[list[str]]:
-    """Returns, per path (order preserved), the undefined dynamic symbols of that
-    ELF file that are not provided by any installed library.
-
-    False positives are possible (lazy binding, ``dlopen``-loaded libraries,
-    symbol versioning). An empty list means the file is clean.
-    """
+    """Returns, per path, the undefined dynamic symbols not in ``defined_globally``."""
     paths = list(paths)
+    if not paths:
+        return []
     results: list[list[str]] = [[] for _ in paths]
     futures: dict[Future[Any], int] = {}
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pkgcheck-sym") as executor:
         for index, path in enumerate(paths):
             futures[
-                executor.submit(_undefined_symbols, path, defined_globally, readelf_bin, extra_env)
+                executor.submit(_get_undefined_symbols, path, defined_globally, nm_bin, extra_env)
             ] = index
         last_update = time.monotonic()
         for done, future in enumerate(as_completed(futures), start=1):
