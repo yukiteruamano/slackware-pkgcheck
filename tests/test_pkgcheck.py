@@ -31,9 +31,7 @@ from pkgcheck.cli import (
 )
 from pkgcheck.libdeps import (
     _is_library_path,
-    _undefined_symbols,
     build_library_owner_index,
-    check_libs_deps,
     check_library_deps,
     check_undefined_symbols,
     collect_defined_symbols,
