@@ -39,7 +39,7 @@ def _contains_control_chars(value: str) -> bool:
 
 
 def validate_safe_path(
-    path: str,
+    path: object,
     allow_absolute: bool = False,
     must_exist: bool = False,
     base_dir: str | None = None,
@@ -124,7 +124,7 @@ def validate_safe_path(
     return normalized
 
 
-def validate_subprocess_arg(arg: str, max_length: int = MAX_ARG_LENGTH) -> str:
+def validate_subprocess_arg(arg: object, max_length: int = MAX_ARG_LENGTH) -> str:
     """Validate an argument passed to subprocess.run().
 
     Args:
@@ -163,7 +163,7 @@ def validate_subprocess_arg(arg: str, max_length: int = MAX_ARG_LENGTH) -> str:
     return arg
 
 
-def validate_exclude_prefix(prefix: str) -> str:
+def validate_exclude_prefix(prefix: object) -> str:
     """Validate a --exclude prefix.
 
     Args:
@@ -208,7 +208,7 @@ def validate_exclude_prefix(prefix: str) -> str:
     return cleaned
 
 
-def validate_suffix(suffix: str, allow_empty: bool = False) -> str:
+def validate_suffix(suffix: object, allow_empty: bool = False) -> str:
     """Validate a file suffix (e.g., '.new', '.bak').
 
     Args:
@@ -249,7 +249,7 @@ def validate_suffix(suffix: str, allow_empty: bool = False) -> str:
     return suffix
 
 
-def validate_backup_suffixes(csv: str) -> tuple[str, ...]:
+def validate_backup_suffixes(csv: object) -> tuple[str, ...]:
     """Validate comma-separated backup suffixes.
 
     Args:
@@ -284,12 +284,12 @@ def validate_backup_suffixes(csv: str) -> tuple[str, ...]:
     return tuple(unique)
 
 
-def validate_new_suffix(value: str) -> str:
+def validate_new_suffix(value: object) -> str:
     """Validate the --new-suffix value."""
     return validate_suffix(value, allow_empty=False)
 
 
-def sanitize_for_subprocess(value: str) -> str:
+def sanitize_for_subprocess(value: object) -> str:
     """Sanitize a string for safe subprocess usage.
 
     Removes control characters that could cause issues in subprocess output parsing.
@@ -327,7 +327,7 @@ def validate_orphans_root(path: str) -> str:
     return validate_safe_path(path, allow_absolute=True, must_exist=True)
 
 
-def validate_binary_path(bin_name: str) -> str:
+def validate_binary_path(bin_name: object) -> str:
     """Validate a binary name (rg, ldd, nm, etc.) found via shutil.which()."""
     if not isinstance(bin_name, str):
         raise ValidationError(f"Binary name must be string, got {type(bin_name).__name__}")

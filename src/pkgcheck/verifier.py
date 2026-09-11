@@ -189,11 +189,6 @@ def _is_elf(path: str) -> bool:
         return False
 
 
-def _is_elf_target(path: str) -> bool:
-    """Check if a path is an ELF file (legacy alias, follows symlinks)."""
-    return _is_elf(path)
-
-
 def check_path_and_elf(
     path: str,
     backup_suffixes: Suffixes = _DEFAULT_BACKUP_SUFFIXES,

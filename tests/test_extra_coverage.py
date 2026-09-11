@@ -28,7 +28,7 @@ from pkgcheck.validate import (
 class ValidateSafePathTest(unittest.TestCase):
     def test_not_string(self) -> None:
         with self.assertRaises(ValidationError):
-            validate_safe_path(123)  # type: ignore
+            validate_safe_path(123)
 
     def test_empty(self) -> None:
         with self.assertRaises(ValidationError):
@@ -122,7 +122,7 @@ class ValidateSafePathTest(unittest.TestCase):
 class ValidateSubprocessArgTest(unittest.TestCase):
     def test_not_string(self) -> None:
         with self.assertRaises(ValidationError):
-            validate_subprocess_arg(123)  # type: ignore
+            validate_subprocess_arg(123)
 
     def test_empty(self) -> None:
         with self.assertRaises(ValidationError):
@@ -152,7 +152,7 @@ class ValidateSubprocessArgTest(unittest.TestCase):
 class ValidateExcludePrefixTest(unittest.TestCase):
     def test_not_string(self) -> None:
         with self.assertRaises(ValidationError):
-            validate_exclude_prefix(123)  # type: ignore
+            validate_exclude_prefix(123)
 
     def test_empty(self) -> None:
         with self.assertRaises(ValidationError):
@@ -183,7 +183,7 @@ class ValidateExcludePrefixTest(unittest.TestCase):
 class ValidateSuffixTest(unittest.TestCase):
     def test_not_string(self) -> None:
         with self.assertRaises(ValidationError):
-            validate_suffix(123)  # type: ignore
+            validate_suffix(123)
 
     def test_empty_not_allowed(self) -> None:
         with self.assertRaises(ValidationError):
@@ -215,7 +215,7 @@ class ValidateSuffixTest(unittest.TestCase):
 class ValidateBackupSuffixesTest(unittest.TestCase):
     def test_not_string(self) -> None:
         with self.assertRaises(ValidationError):
-            validate_backup_suffixes(123)  # type: ignore
+            validate_backup_suffixes(123)
 
     def test_empty_csv(self) -> None:
         with self.assertRaises(ValidationError):
@@ -256,7 +256,7 @@ class SanitizeTest(unittest.TestCase):
 class ValidateBinaryPathTest(unittest.TestCase):
     def test_not_string(self) -> None:
         with self.assertRaises(ValidationError):
-            validate_binary_path(123)  # type: ignore
+            validate_binary_path(123)
 
     def test_empty(self) -> None:
         with self.assertRaises(ValidationError):

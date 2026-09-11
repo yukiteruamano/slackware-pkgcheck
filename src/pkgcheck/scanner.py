@@ -149,16 +149,6 @@ def build_rg_command(rg_bin: str, packages_dir: Path) -> list[str]:
     return [rg_bin, *_RG_FLAGS, _SCAN_PATTERN, "--", str(packages_dir)]
 
 
-def _octal_to_byte(match: re.Match[bytes]) -> bytes:
-    """Decodes a ``\\NNN`` octal escape into a single byte, tolerating malformed values.
-
-    Slackware only encodes bytes 0-255, but a third-party record could contain an
-    escape above ``\\377``; such a value is clamped to ``0xFF`` instead of crashing.
-    """
-    value = int(match.group()[1:], 8)
-    return bytes([value if value <= 255 else 0xFF])
-
-
 def _unescape_path(rel: str) -> str:
     """Decodes the ``\\NNN`` octal escapes Slackware uses for non-ASCII bytes.
 
