@@ -2186,9 +2186,12 @@ class ScannerFallbackTest(unittest.TestCase):
         self.assertFalse(_is_pseudo("var/log/packages", ("var/log/",)))
 
     def test_needed_via_ldd(self) -> None:
-        from pkgcheck.libdeps import _get_needed_libs
+        try:
+            from helpers import _get_needed_libs
+        except ModuleNotFoundError:
+            from tests.helpers import _get_needed_libs
 
-        output = " 0x00000001 (NEEDED)                     Shared library: [libfoo.so.1]\n 0x00000001 (NEEDED)                     Shared library: [libbar.so.2]\n"
+        output = "\tlibfoo.so.1 => not found\n\tlibbar.so.2 => not found\n"
         with mock.patch(
             "pkgcheck.libdeps.subprocess.run",
             return_value=types.SimpleNamespace(stdout=output, stderr=""),
@@ -2199,7 +2202,10 @@ class ScannerFallbackTest(unittest.TestCase):
             self.assertIn("libbar.so.2", missing)
 
     def test_needed_via_ldd_timeout(self) -> None:
-        from pkgcheck.libdeps import _get_needed_libs
+        try:
+            from helpers import _get_needed_libs
+        except ModuleNotFoundError:
+            from tests.helpers import _get_needed_libs
 
         with mock.patch(
             "pkgcheck.libdeps.subprocess.run", side_effect=subprocess.TimeoutExpired("ldd", 60)
@@ -2207,7 +2213,7 @@ class ScannerFallbackTest(unittest.TestCase):
             self.assertEqual(_get_needed_libs("/bin/foo", "ldd"), [])
 
     def test_check_library_deps_safe(self) -> None:
-        with mock.patch("pkgcheck.libdeps._get_needed_libs", side_effect=[["liba.so"], []]):
+        with mock.patch("pkgcheck.libdeps._ldd_missing", side_effect=[["liba.so"], []]):
             result = check_library_deps(["/a", "/b"], workers=2, ldd_bin="ldd", owner_index={})
             self.assertEqual(result, [["liba.so"], []])
 

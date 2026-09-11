@@ -239,19 +239,28 @@ class OrphansExtraTest(unittest.TestCase):
 
 class LibdepsExtraTest(unittest.TestCase):
     def test_get_needed_libs_timeout(self) -> None:
-        from pkgcheck.libdeps import _get_needed_libs
+        try:
+            from helpers import _get_needed_libs
+        except ModuleNotFoundError:
+            from tests.helpers import _get_needed_libs
 
         with mock.patch("pkgcheck.libdeps.subprocess.run", side_effect=OSError("boom")):
             self.assertEqual(_get_needed_libs("/x", "ldd"), [])
 
     def test_nm_symbols_none(self) -> None:
-        from pkgcheck.libdeps import _ldd_symbols
+        try:
+            from helpers import _ldd_symbols
+        except ModuleNotFoundError:
+            from tests.helpers import _ldd_symbols
 
         with mock.patch("pkgcheck.libdeps.subprocess.run", side_effect=OSError("boom")):
             self.assertIsNone(_ldd_symbols("/x", "nm"))
 
     def test_undefined_symbols_empty(self) -> None:
-        from pkgcheck.libdeps import _undefined_symbols
+        try:
+            from helpers import _undefined_symbols
+        except ModuleNotFoundError:
+            from tests.helpers import _undefined_symbols
 
         with mock.patch("pkgcheck.libdeps.subprocess.run", side_effect=OSError("boom")):
             self.assertEqual(_undefined_symbols("/x", set(), "nm"), [])

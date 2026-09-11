@@ -91,9 +91,9 @@ def _build_nm_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
 def _ldd_missing(path: str, ldd_bin: str, extra_env: dict[str, str] | None = None) -> list[str]:
     """Runs ``ldd -- path`` and returns libraries reported as ``not found``.
 
-    Filters glibc merged stubs when libc is known to be installed (via ld cache
-    check) to avoid false positives on glibc 2.34+ systems. Returns [] for
-    statically linked or non-dynamic files.
+    Filters glibc merged stubs when libc is known to be installed to avoid
+    false positives on glibc 2.34+ systems. Returns [] for statically linked
+    or non-dynamic files.
     """
     try:
         result = subprocess.run(
@@ -123,12 +123,6 @@ def _ldd_missing(path: str, ldd_bin: str, extra_env: dict[str, str] | None = Non
         if lib not in missing:
             missing.append(lib)
     return missing
-
-
-# Backwards compatibility alias for tests that import _get_needed_libs
-def _get_needed_libs(path: str, ldd_bin: str, extra_env: dict[str, str] | None = None) -> list[str]:
-    """Alias for ``_ldd_missing`` (kept for tests)."""
-    return _ldd_missing(path, ldd_bin, extra_env)
 
 
 def _soname_match(needed: str, available: str) -> bool:
@@ -323,13 +317,6 @@ def _nm_symbols(path: str, nm_bin: str, extra_env: dict[str, str] | None = None)
     return symbols
 
 
-# Alias for tests that import _ldd_symbols as nm wrapper
-def _ldd_symbols(
-    path: str, nm_bin: str, extra_env: dict[str, str] | None = None
-) -> set[str] | None:
-    return _nm_symbols(path, nm_bin, extra_env)
-
-
 def _get_undefined_symbols(
     path: str, defined_globally: set[str], nm_bin: str, extra_env: dict[str, str] | None = None
 ) -> list[str]:
@@ -373,13 +360,6 @@ def _get_undefined_symbols(
         seen.add(name)
         undefined.append(name)
     return undefined
-
-
-# Alias for tests that import _undefined_symbols
-def _undefined_symbols(
-    path: str, defined_globally: set[str], nm_bin: str, extra_env: dict[str, str] | None = None
-) -> list[str]:
-    return _get_undefined_symbols(path, defined_globally, nm_bin, extra_env)
 
 
 def collect_defined_symbols(
