@@ -51,11 +51,6 @@ def _load_json_report(path: Path) -> dict[str, Any]:
         ) from exc
 
 
-def _index_to_sets(index: dict[str, Any]) -> dict[str, set[str]]:
-    # index is {"pkg": ["/path", ...]}
-    return {pkg: set(paths) for pkg, paths in index.items()}
-
-
 def diff_reports(from_path: Path, to_path: Path) -> dict[str, Any]:
     """Diffs two JSON reports and returns added/removed per category.
 

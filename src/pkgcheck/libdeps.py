@@ -10,7 +10,6 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-import threading
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait
@@ -34,9 +33,6 @@ type LibEntries = Iterable[tuple[str, str]]
 
 # Shared libraries live under these prefixes; their basename maps to a package.
 _LIB_PREFIXES = ("usr/lib/", "usr/lib64/", "lib/", "lib64/", "usr/libexec/")
-
-# Standard system library directories searched by the dynamic loader.
-_STD_LIB_DIRS = ("/lib", "/lib64", "/usr/lib", "/usr/lib64", "/usr/libexec")
 
 # Glibc merged stubs: since glibc 2.34 these are provided by libc.so.6
 _GLIBC_MERGED_STUBS: frozenset[str] = frozenset(
@@ -63,80 +59,6 @@ def _canonical_libname(name: str) -> str:
 def _has_libc(owner_index: dict[str, str]) -> bool:
     """Returns whether libc (provider for merged stubs) is installed."""
     return any(k.startswith("libc.so") or k.startswith("libc-") for k in owner_index)
-
-
-# Cache for ldconfig lookups (per-run, shared across workers)
-_ldcache: set[str] | None = None
-_ldcache_lock = threading.Lock()
-
-
-def _load_ldcache() -> set[str]:
-    """Parses ``ldconfig -p`` into a set of basenames; empty on failure."""
-    global _ldcache
-    if _ldcache is not None:
-        return _ldcache
-    with _ldcache_lock:
-        if _ldcache is not None:
-            return _ldcache
-        try:
-            import shutil
-
-            ldconfig_bin = shutil.which("ldconfig") or "ldconfig"
-            # validate if absolute
-            if ldconfig_bin.startswith("/"):
-                try:
-                    from pkgcheck.validate import validate_binary_path
-
-                    ldconfig_bin = validate_binary_path(ldconfig_bin)
-                except Exception:
-                    # fall back to bare name on validation failure
-                    ldconfig_bin = "ldconfig"
-            result = subprocess.run(
-                [ldconfig_bin, "-p"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-                timeout=10,
-                env={**os.environ, "LC_ALL": "C"},
-            )
-            libs: set[str] = set()
-            for line in result.stdout.splitlines():
-                if "=>" in line:
-                    part = line.strip().split(" ", 1)[0]
-                    if part:
-                        libs.add(part)
-                        libs.add(_canonical_libname(part))
-            _ldcache = libs
-            return libs
-        except Exception:
-            _ldcache = set()
-            return _ldcache
-
-
-def _exists_on_fs(lib: str) -> bool:
-    """Returns whether ``lib`` exists in a standard library directory."""
-    for d in _STD_LIB_DIRS:
-        if Path(d, lib).exists():
-            return True
-        canon = _canonical_libname(lib)
-        if canon != lib and Path(d, canon).exists():
-            return True
-    return False
-
-
-def _in_ldcache(lib: str) -> bool:
-    """Returns whether ``lib`` is known to the dynamic loader cache."""
-    cache = _load_ldcache()
-    if not cache:
-        return False
-    if lib in cache:
-        return True
-    canon = _canonical_libname(lib)
-    if canon in cache:
-        return True
-    return any(_soname_match(lib, cached) or _soname_match(canon, cached) for cached in cache)
 
 
 def _should_report(done: int, total: int, last_update: float) -> bool:
@@ -240,11 +162,11 @@ def _soname_match(needed: str, available: str) -> bool:
 
 
 def _filter_missing_with_owner(missing: list[str], owner_index: dict[str, str]) -> list[str]:
-    """Filters ``missing`` using owner_index soname match and system cache.
+    """Filters ``missing`` using owner_index soname match.
 
     A library is considered NOT missing if any installed package provides a
-    compatible soname, or it is in ld cache / on FS, or it is a glibc merged
-    stub and libc is installed.
+    compatible soname, or it is a glibc merged stub and libc is installed.
+    ``ldd`` output is authoritative: if ``ldd`` reports ``not found``, report it.
     """
     if not missing:
         return []
@@ -263,12 +185,7 @@ def _filter_missing_with_owner(missing: list[str], owner_index: dict[str, str]) 
                 break
         if found:
             continue
-        # Finally check ld cache / FS to suppress false positives where ldd
-        # says not found but file exists in non-standard location already
-        # indexed by loader. However ldd's not found is authoritative, so we
-        # only suppress if the file truly exists on FS or in cache AND
-        # owner_index had it but under canonical name.
-        # For now, respect ldd: if ldd says not found, report it.
+        # ldd is authoritative: if ldd says not found, report it.
         filtered.append(lib)
     return filtered
 
