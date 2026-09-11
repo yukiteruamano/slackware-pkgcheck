@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 ### Added
 - (unreleased changes will be listed here)
 
+## [1.0.1] - 2026-09-11
+### Removed
+- Dead code: `libdeps` ld-cache/FS helpers (`_load_ldcache`, `_in_ldcache`, `_exists_on_fs`, `_STD_LIB_DIRS`), `diff` `_index_to_sets`, `scanner` `_octal_to_byte`, `verifier` `_is_elf_target`
+- Test-only aliases from production (`_get_needed_libs`, `_ldd_symbols`, `_undefined_symbols` moved to `tests/helpers.py`)
+### Changed
+- `validate` inputs widened from `str` to `object` (honest defense-in-depth typing; `isinstance` guards now meaningful to static analyzers)
+- Stale `ldd` tests updated to `not found` output format; `check_library_deps` mock retargeted to `_ldd_missing`
+
 ## [1.0.0] - 2026-08-24
 ### Changed
 - Stable release `1.0.0`: `libdeps` finalized on fast loader-aware `ldd` + `nm -D` (no `readelf`/`pyelftools`; `readelf` mentions purged from `src/` and `.venv`).
