@@ -6,6 +6,17 @@ All notable changes to this project will be documented in this file.
 ### Added
 - (unreleased changes will be listed here)
 
+## [1.0.2] - 2026-09-11
+### Fixed
+- 3 hanging `future_exception` tests (mock retargeted `wait` → `as_completed`); `make coverage` no longer hangs
+- Stale `ldd` tests rewritten to `not found` output format
+### Added
+- 50+ gap tests (libdeps/cli/verifier/scanner/diff/orphans/reporter); coverage 85% → 98%, `cli.py`/`validate.py` 100%
+### Changed
+- Coverage `fail_under` 85 → 90
+### Removed
+- Defensive-dead guards: soname `IndexError`, diff `_normalize` fallback + summary `TypeError`, `validate` impossible absolute check
+
 ## [1.0.1] - 2026-09-11
 ### Removed
 - Dead code: `libdeps` ld-cache/FS helpers (`_load_ldcache`, `_in_ldcache`, `_exists_on_fs`, `_STD_LIB_DIRS`), `diff` `_index_to_sets`, `scanner` `_octal_to_byte`, `verifier` `_is_elf_target`
