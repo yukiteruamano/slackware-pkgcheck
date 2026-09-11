@@ -197,10 +197,6 @@ def validate_exclude_prefix(prefix: object) -> str:
     if ".." in cleaned.split("/"):
         raise ValidationError(f"Exclude prefix contains traversal: {cleaned}")
 
-    # Must not be absolute
-    if Path(cleaned).is_absolute():
-        raise ValidationError(f"Exclude prefix must be relative: {cleaned}")
-
     # Ensure trailing slash for prefix matching
     if not cleaned.endswith("/"):
         cleaned += "/"

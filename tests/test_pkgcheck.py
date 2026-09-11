@@ -491,7 +491,7 @@ class LibdepsTest(unittest.TestCase):
             f1 = mock.MagicMock()
             f1.result.side_effect = RuntimeError("boom")
             mock_exec.submit.return_value = f1
-            with mock.patch("pkgcheck.libdeps.wait", return_value=([f1], set())):
+            with mock.patch("pkgcheck.libdeps.as_completed", return_value=[f1]):
                 result = check_library_deps(["/x"], 1, "ldd", {})
             self.assertEqual(result, [[]])
 
@@ -502,7 +502,7 @@ class LibdepsTest(unittest.TestCase):
             f1 = mock.MagicMock()
             f1.result.side_effect = RuntimeError("boom")
             mock_exec.submit.return_value = f1
-            with mock.patch("pkgcheck.libdeps.wait", return_value=([f1], set())):
+            with mock.patch("pkgcheck.libdeps.as_completed", return_value=[f1]):
                 result = collect_defined_symbols(["/x"], 1, "nm")
             self.assertEqual(result, set())
 
@@ -513,7 +513,7 @@ class LibdepsTest(unittest.TestCase):
             f1 = mock.MagicMock()
             f1.result.side_effect = RuntimeError("boom")
             mock_exec.submit.return_value = f1
-            with mock.patch("pkgcheck.libdeps.wait", return_value=([f1], set())):
+            with mock.patch("pkgcheck.libdeps.as_completed", return_value=[f1]):
                 result = check_undefined_symbols(["/x"], set(), 1, "nm")
             self.assertEqual(result, [[]])
 

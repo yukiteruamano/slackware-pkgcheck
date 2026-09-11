@@ -136,20 +136,13 @@ def _soname_match(needed: str, available: str) -> bool:
         return True
     # Major soname matching with boundary check
     if ".so." in needed and ".so." in available:
-        try:
-            needed_parts = needed.split(".so.", 1)
-            available_parts = available.split(".so.", 1)
-            if len(needed_parts) != 2 or len(available_parts) != 2:
-                return False
-            if needed_parts[0] != available_parts[0]:
-                return False
-            needed_major = needed_parts[1].split(".", 1)[0]
-            available_major = available_parts[1].split(".", 1)[0]
-            if needed_major == available_major:
-                return True
-        except IndexError:
-            pass
-        return False
+        needed_base, needed_ver = needed.split(".so.", 1)
+        available_base, available_ver = available.split(".so.", 1)
+        if needed_base != available_base:
+            return False
+        needed_major = needed_ver.split(".", 1)[0]
+        available_major = available_ver.split(".", 1)[0]
+        return needed_major == available_major
     # For .so.N vs .so.N.M without .so. split already handled, fallback to exact
     # Prevent libfoo.so.1 matching libfoo.so.10
     return needed.startswith(available + ".") or available.startswith(needed + ".")

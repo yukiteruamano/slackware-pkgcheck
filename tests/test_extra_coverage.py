@@ -91,6 +91,15 @@ class ValidateSafePathTest(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 validate_safe_path("a/../b", base_dir="/tmp")
 
+    def test_traversal_first_block_escape(self) -> None:
+        with self.assertRaises(ValidationError):
+            validate_safe_path("../escape", base_dir=os.getcwd())
+
+    def test_base_second_block_resolve_exception(self) -> None:
+        with mock.patch("pathlib.Path.resolve", side_effect=OSError("boom")):
+            with self.assertRaises(ValidationError):
+                validate_safe_path("plain", base_dir="/tmp")
+
     def test_must_exist_ok(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "file"

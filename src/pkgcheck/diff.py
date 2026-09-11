@@ -94,11 +94,9 @@ def diff_reports(from_path: Path, to_path: Path) -> dict[str, Any]:
                 if isinstance(obj, dict):
                     return {k: _normalize(v) for k, v in sorted(obj.items())}
                 if isinstance(obj, list):
-                    # For broken_libs, list of dicts: sort by binary name if possible
-                    try:
-                        return sorted(obj, key=lambda x: json.dumps(x, sort_keys=True))
-                    except Exception:
-                        return sorted(obj, key=str) if all(isinstance(x, str) for x in obj) else obj
+                    # For broken_libs, list of dicts: sort by binary name if possible.
+                    # Reports are JSON-loaded, so values are always serializable.
+                    return sorted(obj, key=lambda x: json.dumps(x, sort_keys=True))
                 return obj
 
             av_n = _normalize(av)
@@ -136,10 +134,7 @@ def diff_reports(from_path: Path, to_path: Path) -> dict[str, Any]:
         av = a_sum.get(key, 0)
         bv = b_sum.get(key, 0)
         if av != bv:
-            try:
-                delta = bv - av if isinstance(av, int) and isinstance(bv, int) else None
-            except TypeError:
-                delta = None
+            delta = bv - av if isinstance(av, int) and isinstance(bv, int) else None
             summary_diff[key] = {"from": av, "to": bv, "delta": delta}
     if summary_diff:
         result["diff"]["summary"] = summary_diff
